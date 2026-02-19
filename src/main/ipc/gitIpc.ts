@@ -11,6 +11,7 @@ import {
   getFileDiff as gitGetFileDiff,
   stageFile as gitStageFile,
   stageAllFiles as gitStageAllFiles,
+  stageDiffRange as gitStageDiffRange,
   unstageFile as gitUnstageFile,
   revertFile as gitRevertFile,
 } from '../services/GitService';
@@ -171,6 +172,39 @@ export function registerGitIpc() {
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
+
+  // Git: Stage selected diff range (partial staging)
+  ipcMain.handle(
+    'git:stage-diff-range',
+    async (
+      _,
+      args: { taskPath: string; filePath: string; startLine: number; endLine: number }
+    ) => {
+      try {
+        log.info('Staging diff range:', {
+          taskPath: args.taskPath,
+          filePath: args.filePath,
+          startLine: args.startLine,
+          endLine: args.endLine,
+        });
+        const result = await gitStageDiffRange(
+          args.taskPath,
+          args.filePath,
+          args.startLine,
+          args.endLine
+        );
+        return { success: true, ...result };
+      } catch (error) {
+        log.error('Failed to stage diff range:', {
+          filePath: args.filePath,
+          startLine: args.startLine,
+          endLine: args.endLine,
+          error,
+        });
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  );
 
   // Git: Unstage file
   ipcMain.handle('git:unstage-file', async (_, args: { taskPath: string; filePath: string }) => {

@@ -8,6 +8,7 @@ export interface FileChange {
   additions: number;
   deletions: number;
   isStaged: boolean;
+  hasUnstaged: boolean;
   diff?: string;
 }
 
@@ -125,6 +126,10 @@ export function useFileChanges(taskPath?: string, options: UseFileChangesOptions
               additions: change.additions || 0,
               deletions: change.deletions || 0,
               isStaged: change.isStaged || false,
+              hasUnstaged:
+                typeof change.hasUnstaged === 'boolean'
+                  ? Boolean(change.hasUnstaged)
+                  : !change.isStaged,
               diff: change.diff,
             }))
             .filter((c) => !c.path.startsWith('.emdash/') && c.path !== 'PLANNING.md');

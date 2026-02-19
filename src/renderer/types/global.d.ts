@@ -205,6 +205,8 @@ declare global {
           status: string;
           additions: number;
           deletions: number;
+          isStaged: boolean;
+          hasUnstaged: boolean;
           diff?: string;
         }>;
         error?: string;

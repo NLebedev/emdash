@@ -541,6 +541,7 @@ declare global {
           additions: number;
           deletions: number;
           isStaged: boolean;
+          hasUnstaged: boolean;
           diff?: string;
         }>;
         error?: string;
@@ -577,6 +578,17 @@ declare global {
       }>;
       stageAllFiles: (args: { taskPath: string }) => Promise<{
         success: boolean;
+        error?: string;
+      }>;
+      stageDiffRange: (args: {
+        taskPath: string;
+        filePath: string;
+        startLine: number;
+        endLine: number;
+      }) => Promise<{
+        success: boolean;
+        staged?: boolean;
+        stagedHunks?: number;
         error?: string;
       }>;
       unstageFile: (args: { taskPath: string; filePath: string }) => Promise<{

@@ -292,6 +292,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stageFile: (args: { taskPath: string; filePath: string }) =>
     ipcRenderer.invoke('git:stage-file', args),
   stageAllFiles: (args: { taskPath: string }) => ipcRenderer.invoke('git:stage-all-files', args),
+  stageDiffRange: (args: {
+    taskPath: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+  }) => ipcRenderer.invoke('git:stage-diff-range', args),
   unstageFile: (args: { taskPath: string; filePath: string }) =>
     ipcRenderer.invoke('git:unstage-file', args),
   revertFile: (args: { taskPath: string; filePath: string }) =>
@@ -818,6 +824,8 @@ export interface ElectronAPI {
       status: string;
       additions: number;
       deletions: number;
+      isStaged: boolean;
+      hasUnstaged: boolean;
       diff?: string;
     }>;
     error?: string;
@@ -842,6 +850,12 @@ export interface ElectronAPI {
     diff?: { lines: Array<{ left?: string; right?: string; type: 'context' | 'add' | 'del' }> };
     error?: string;
   }>;
+  stageDiffRange: (args: {
+    taskPath: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+  }) => Promise<{ success: boolean; staged?: boolean; stagedHunks?: number; error?: string }>;
   gitCommitAndPush: (args: {
     taskPath: string;
     commitMessage?: string;
