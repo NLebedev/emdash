@@ -2,6 +2,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 
 const execFileAsync = promisify(execFile);
 const MAX_UNTRACKED_LINECOUNT_BYTES = 512 * 1024;
@@ -58,7 +59,64 @@ export type GitChange = {
   additions: number;
   deletions: number;
   isStaged: boolean;
+  hasUnstaged: boolean;
 };
+
+type ParsedDiffHunk = {
+  header: string;
+  body: string[];
+  newStart: number;
+  newCount: number;
+};
+
+function parseUnifiedDiff(diffText: string): { fileHeaders: string[]; hunks: ParsedDiffHunk[] } {
+  const lines = diffText
+    .replace(/\r/g, '')
+    .split('\n')
+    .filter((line, index, arr) => !(index === arr.length - 1 && line === ''));
+
+  const fileHeaders: string[] = [];
+  const hunks: ParsedDiffHunk[] = [];
+  let i = 0;
+
+  while (i < lines.length && !lines[i].startsWith('@@ ')) {
+    fileHeaders.push(lines[i]);
+    i++;
+  }
+
+  while (i < lines.length) {
+    const headerLine = lines[i];
+    if (!headerLine.startsWith('@@ ')) {
+      i++;
+      continue;
+    }
+
+    const match = headerLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+    if (!match) {
+      i++;
+      continue;
+    }
+
+    const newStart = Number.parseInt(match[1], 10);
+    const newCount = match[2] ? Number.parseInt(match[2], 10) : 1;
+
+    i++;
+    const body: string[] = [];
+    while (i < lines.length && !lines[i].startsWith('@@ ')) {
+      body.push(lines[i]);
+      i++;
+    }
+
+    hunks.push({
+      header: headerLine,
+      body,
+      newStart,
+      newCount,
+    });
+  }
+
+  return { fileHeaders, hunks };
+}
 
 export async function getStatus(taskPath: string): Promise<GitChange[]> {
   try {
@@ -99,8 +157,12 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
     else if (statusCode.includes('R')) status = 'renamed';
     else if (statusCode.includes('M')) status = 'modified';
 
-    // Check if file is staged (first character of status code indicates staged changes)
-    const isStaged = statusCode[0] !== ' ' && statusCode[0] !== '?';
+    const indexStatus = statusCode[0] ?? ' ';
+    const worktreeStatus = statusCode[1] ?? ' ';
+
+    // First character is index (staged), second is working tree (unstaged)
+    const isStaged = indexStatus !== ' ' && indexStatus !== '?';
+    const hasUnstaged = worktreeStatus !== ' ';
     let additions = 0;
     let deletions = 0;
 
@@ -144,7 +206,7 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
       }
     }
 
-    changes.push({ path: filePath, status, additions, deletions, isStaged });
+    changes.push({ path: filePath, status, additions, deletions, isStaged, hasUnstaged });
   }
 
   return changes;
@@ -156,6 +218,69 @@ export async function stageFile(taskPath: string, filePath: string): Promise<voi
 
 export async function stageAllFiles(taskPath: string): Promise<void> {
   await execFileAsync('git', ['add', '-A'], { cwd: taskPath });
+}
+
+export async function stageDiffRange(
+  taskPath: string,
+  filePath: string,
+  startLine: number,
+  endLine: number
+): Promise<{ staged: boolean; stagedHunks: number }> {
+  const normalizedStart = Math.max(1, Math.min(startLine, endLine));
+  const normalizedEnd = Math.max(1, Math.max(startLine, endLine));
+
+  const { stdout: rawDiff } = await execFileAsync(
+    'git',
+    ['diff', '--no-color', '--no-ext-diff', '--unified=0', '--', filePath],
+    { cwd: taskPath }
+  );
+
+  if (!rawDiff.trim()) {
+    return { staged: false, stagedHunks: 0 };
+  }
+
+  const { fileHeaders, hunks } = parseUnifiedDiff(rawDiff);
+  if (hunks.length === 0) {
+    return { staged: false, stagedHunks: 0 };
+  }
+
+  const selectedHunks = hunks.filter((hunk) => {
+    const hunkStart = hunk.newStart;
+    const hunkEnd = hunk.newCount > 0 ? hunk.newStart + hunk.newCount - 1 : hunk.newStart;
+    return normalizedEnd >= hunkStart && normalizedStart <= hunkEnd;
+  });
+
+  if (selectedHunks.length === 0) {
+    return { staged: false, stagedHunks: 0 };
+  }
+
+  const patchLines = [...fileHeaders];
+  for (const hunk of selectedHunks) {
+    patchLines.push(hunk.header, ...hunk.body);
+  }
+  const patchContent = `${patchLines.join('\n')}\n`;
+
+  const tempPatchPath = path.join(
+    os.tmpdir(),
+    `emdash-stage-range-${Date.now()}-${Math.random().toString(36).slice(2)}.patch`
+  );
+
+  try {
+    await fs.promises.writeFile(tempPatchPath, patchContent, 'utf8');
+    await execFileAsync(
+      'git',
+      ['apply', '--cached', '--unidiff-zero', '--whitespace=nowarn', tempPatchPath],
+      { cwd: taskPath }
+    );
+  } finally {
+    try {
+      await fs.promises.unlink(tempPatchPath);
+    } catch {
+      // best effort cleanup
+    }
+  }
+
+  return { staged: true, stagedHunks: selectedHunks.length };
 }
 
 export async function unstageFile(taskPath: string, filePath: string): Promise<void> {

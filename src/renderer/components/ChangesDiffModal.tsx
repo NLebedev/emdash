@@ -19,6 +19,7 @@ import { dispatchFileChangeEvent } from '../lib/fileChangeEvents';
 import { useDiffEditorComments } from '../hooks/useDiffEditorComments';
 import { useTaskComments } from '../hooks/useLineComments';
 import { registerActiveCodeEditor } from '../lib/activeCodeEditor';
+import { getStageAnchorLines, splitChangesByStage } from '../lib/diffStaging';
 import { useTaskScope } from './TaskScopeContext';
 
 interface ChangesDiffModalProps {
@@ -59,7 +60,11 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
   );
   const editorRef = useRef<monaco.editor.IStandaloneDiffEditor | null>(null);
   const changeDisposableRef = useRef<monaco.IDisposable | null>(null);
+  const stageClickDisposableRef = useRef<monaco.IDisposable | null>(null);
+  const stageDecorationIdsRef = useRef<string[]>([]);
   const activeEditorCleanupRef = useRef<(() => void) | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const [isStagingRange, setIsStagingRange] = useState(false);
 
   // Integrate line comments - use state (not ref) so hook re-runs when editor mounts
   useDiffEditorComments({
@@ -76,6 +81,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
     original: string;
     modified: string;
     initialModified: string;
+    diffLines: DiffLine[];
     language: string;
     loading: boolean;
     error: string | null;
@@ -83,6 +89,11 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
   const [modifiedDraft, setModifiedDraft] = useState<string>('');
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const selectedFileChange = selected ? files.find((file) => file.path === selected) : undefined;
+  const selectedHasUnstagedChanges = selectedFileChange
+    ? selectedFileChange.hasUnstaged || !selectedFileChange.isStaged
+    : false;
+  const isDirty = fileData ? modifiedDraft !== fileData.initialModified : false;
 
   // Close on escape key
   useEffect(() => {
@@ -115,6 +126,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
             original: '',
             modified: '',
             initialModified: '',
+            diffLines: [],
             language: 'plaintext',
             loading: false,
             error: 'File not found',
@@ -133,6 +145,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
           original: '',
           modified: '',
           initialModified: '',
+          diffLines: [],
           language: 'plaintext',
           loading: false,
           error: 'Binary file - diff not available',
@@ -146,6 +159,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
         original: '',
         modified: '',
         initialModified: '',
+        diffLines: [],
         language,
         loading: true,
         error: null,
@@ -205,6 +219,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
             original: originalContent,
             modified: modifiedContent,
             initialModified: modifiedContent,
+            diffLines,
             language,
             loading: false,
             error: null,
@@ -219,6 +234,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
             original: '',
             modified: '',
             initialModified: '',
+            diffLines: [],
             language,
             loading: false,
             error: error?.message || 'Failed to load file diff',
@@ -235,7 +251,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, selected, safeTaskPath]); // Removed 'files' to prevent constant reloading - files array changes every 5s
+  }, [open, selected, safeTaskPath, reloadNonce]); // Removed 'files' to prevent constant reloading - files array changes every 5s
 
   // Add Monaco theme and styles
   useEffect(() => {
@@ -344,6 +360,39 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       .comment-hover-icon.comment-hover-icon-pinned::before {
         background-color: hsl(var(--foreground));
       }
+      .stage-change-glyph {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 22px;
+        margin: 1px auto;
+        border-radius: 6px;
+        border: 1px solid transparent;
+        background: transparent;
+        box-sizing: border-box;
+        cursor: pointer;
+        pointer-events: auto;
+        transition: background-color 0.15s ease, border-color 0.15s ease;
+      }
+      .stage-change-glyph::before {
+        content: '';
+        display: block;
+        width: 12px;
+        height: 12px;
+        background-color: hsl(var(--muted-foreground));
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'%3E%3C/polyline%3E%3C/svg%3E");
+        mask-size: contain;
+        mask-repeat: no-repeat;
+        mask-position: center;
+      }
+      .stage-change-glyph:hover {
+        background-color: hsl(var(--foreground) / 0.08);
+        border-color: hsl(var(--border));
+      }
+      .stage-change-glyph:hover::before {
+        background-color: hsl(var(--foreground));
+      }
       /* Remove any borders from glyph margin items */
       .monaco-editor .glyph-margin > div {
         border: none !important;
@@ -365,11 +414,6 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       .monaco-diff-editor .dirty-diff-added-indicator {
         border: none !important;
         box-shadow: none !important;
-      }
-      /* Hide the revert arrow that shows on hover in diff gutter */
-      .monaco-diff-editor .glyph-margin .codicon-arrow-left,
-      .monaco-diff-editor .glyph-margin .codicon-discard {
-        display: none !important;
       }
       /* Ensure view zones (comment widgets) are interactive */
       .monaco-editor .view-zones {
@@ -457,14 +501,20 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
   // Cleanup editor on unmount
   useEffect(() => {
     return () => {
-      if (editorRef.current) {
+      const currentEditor = editorRef.current;
+      if (currentEditor) {
         try {
-          editorRef.current.dispose();
+          currentEditor.getModifiedEditor().deltaDecorations(stageDecorationIdsRef.current, []);
+        } catch {
+          // ignore
+        }
+        try {
+          currentEditor.dispose();
         } catch {
           // Ignore disposal errors
         }
-        editorRef.current = null;
       }
+      editorRef.current = null;
       try {
         changeDisposableRef.current?.dispose();
       } catch {
@@ -472,11 +522,18 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       }
       changeDisposableRef.current = null;
       try {
+        stageClickDisposableRef.current?.dispose();
+      } catch {
+        // ignore
+      }
+      stageClickDisposableRef.current = null;
+      try {
         activeEditorCleanupRef.current?.();
       } catch {
         // ignore
       }
       activeEditorCleanupRef.current = null;
+      stageDecorationIdsRef.current = [];
 
       // Reset diagnostic options when closing modal
       loader
@@ -586,6 +643,139 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
     }
   };
 
+  useEffect(() => {
+    const diffEditor = editorRef.current;
+    if (!diffEditor) return;
+
+    const modifiedEditor = diffEditor.getModifiedEditor();
+    if (!fileData || fileData.loading || fileData.error || isDirty || !selectedHasUnstagedChanges) {
+      try {
+        stageDecorationIdsRef.current = modifiedEditor.deltaDecorations(
+          stageDecorationIdsRef.current,
+          []
+        );
+      } catch {
+        // ignore decoration cleanup errors
+      }
+      return;
+    }
+
+    const anchorLines = getStageAnchorLines(fileData.diffLines);
+    const stageDecorations = anchorLines.map((lineNumber) => ({
+      range: {
+        startLineNumber: lineNumber,
+        startColumn: 1,
+        endLineNumber: lineNumber,
+        endColumn: 1,
+      },
+      options: {
+        glyphMarginClassName: 'stage-change-glyph',
+        glyphMarginHoverMessage: { value: 'Stage this change block' },
+      },
+    }));
+
+    try {
+      stageDecorationIdsRef.current = modifiedEditor.deltaDecorations(
+        stageDecorationIdsRef.current,
+        stageDecorations
+      );
+    } catch {
+      // ignore decoration errors
+    }
+  }, [fileData, isDirty, selectedHasUnstagedChanges]);
+
+  useEffect(() => {
+    const diffEditor = editorRef.current;
+    if (!diffEditor) return;
+
+    const modifiedEditor = diffEditor.getModifiedEditor();
+    try {
+      stageClickDisposableRef.current?.dispose();
+    } catch {
+      // ignore
+    }
+
+    stageClickDisposableRef.current = modifiedEditor.onMouseDown((event) => {
+      const element = event.target.element as HTMLElement | null;
+      const clickedStageGlyph = element?.closest('.stage-change-glyph');
+      if (!clickedStageGlyph) return;
+
+      event.event.preventDefault();
+      event.event.stopPropagation();
+
+      if (!selected || !safeTaskPath) return;
+      if (!selectedHasUnstagedChanges) return;
+      const lineNumber = event.target.position?.lineNumber;
+      if (!lineNumber) return;
+
+      if (isDirty) {
+        toast({
+          title: 'Save required',
+          description: 'Save this file before staging a change block.',
+          variant: 'destructive',
+        });
+        return;
+      }
+
+      if (isStagingRange) return;
+
+      void (async () => {
+        setIsStagingRange(true);
+        try {
+          const result = await window.electronAPI.stageDiffRange({
+            taskPath: safeTaskPath,
+            filePath: selected,
+            startLine: lineNumber,
+            endLine: lineNumber,
+          });
+
+          if (!result?.success) {
+            throw new Error(result?.error || 'Failed to stage selected change block');
+          }
+
+          if (!result.staged) {
+            toast({
+              title: 'Nothing to stage',
+              description: 'No unstaged change block was found at this location.',
+            });
+            return;
+          }
+
+          dispatchFileChangeEvent(safeTaskPath, selected);
+          if (onRefreshChanges) {
+            await onRefreshChanges();
+          }
+          setReloadNonce((prev) => prev + 1);
+        } catch (error: any) {
+          toast({
+            title: 'Stage Failed',
+            description: error?.message || 'Failed to stage selected change block.',
+            variant: 'destructive',
+          });
+        } finally {
+          setIsStagingRange(false);
+        }
+      })();
+    });
+
+    return () => {
+      try {
+        stageClickDisposableRef.current?.dispose();
+      } catch {
+        // ignore
+      }
+      stageClickDisposableRef.current = null;
+    };
+  }, [
+    selected,
+    safeTaskPath,
+    isDirty,
+    isStagingRange,
+    onRefreshChanges,
+    toast,
+    selectedHasUnstagedChanges,
+  ]);
+
   const handleSave = async () => {
     if (!selected || !fileData || !safeTaskPath) return;
     setIsSaving(true);
@@ -609,6 +799,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       if (onRefreshChanges) {
         await onRefreshChanges();
       }
+      setReloadNonce((prev) => prev + 1);
     } catch (error: any) {
       const message = error?.message || 'Failed to save file';
       setSaveError(message);
@@ -628,7 +819,33 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
     handleSaveRef.current = handleSave;
   }, [handleSave]);
 
-  const isDirty = fileData ? modifiedDraft !== fileData.initialModified : false;
+  const { staged: stagedFiles, unstaged: unstagedFiles } = splitChangesByStage(files);
+
+  const renderSidebarFile = (file: FileChange, sectionKey: 'staged' | 'unstaged', index: number) => (
+    <button
+      key={`${sectionKey}-${file.path}-${index}`}
+      className={`w-full border-b border-border px-3 py-2 text-left text-sm hover:bg-muted dark:border-border dark:hover:bg-accent ${
+        selected === file.path
+          ? 'bg-muted text-foreground dark:bg-muted dark:text-foreground'
+          : 'text-foreground'
+      }`}
+      onClick={() => setSelected(file.path)}
+    >
+      <div className="flex min-w-0 items-center gap-1">
+        <div className="truncate font-medium">{file.path}</div>
+        {selected === file.path && isDirty && <div className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-blue-500" />}
+      </div>
+      <div className="text-xs text-muted-foreground">
+        {file.status} • +{file.additions} / -{file.deletions}
+        {commentCounts[file.path] > 0 && (
+          <span className="text-blue-600 dark:text-blue-400">
+            {' '}
+            • {commentCounts[file.path]} {commentCounts[file.path] === 1 ? 'comment' : 'comments'}
+          </span>
+        )}
+      </div>
+    </button>
+  );
 
   if (typeof document === 'undefined') {
     return null;
@@ -665,34 +882,18 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
               <div className="px-3 py-2 text-xs tracking-wide text-muted-foreground">
                 Changed Files
               </div>
-              {files.map((f) => (
-                <button
-                  key={f.path}
-                  className={`w-full border-b border-border px-3 py-2 text-left text-sm hover:bg-muted dark:border-border dark:hover:bg-accent ${
-                    selected === f.path
-                      ? 'bg-muted text-foreground dark:bg-muted dark:text-foreground'
-                      : 'text-foreground'
-                  }`}
-                  onClick={() => setSelected(f.path)}
-                >
-                  <div className="flex min-w-0 items-center gap-1">
-                    <div className="truncate font-medium">{f.path}</div>
-                    {selected === f.path && isDirty && (
-                      <div className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-blue-500" />
-                    )}
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    {f.status} • +{f.additions} / -{f.deletions}
-                    {commentCounts[f.path] > 0 && (
-                      <span className="text-blue-600 dark:text-blue-400">
-                        {' '}
-                        • {commentCounts[f.path]}{' '}
-                        {commentCounts[f.path] === 1 ? 'comment' : 'comments'}
-                      </span>
-                    )}
-                  </div>
-                </button>
-              ))}
+              {stagedFiles.length > 0 && (
+                <div className="border-y border-border px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Staged
+                </div>
+              )}
+              {stagedFiles.map((file, index) => renderSidebarFile(file, 'staged', index))}
+              {unstagedFiles.length > 0 && (
+                <div className="border-y border-border px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Unstaged
+                </div>
+              )}
+              {unstagedFiles.map((file, index) => renderSidebarFile(file, 'unstaged', index))}
             </div>
 
             <div className="flex min-w-0 flex-1 flex-col">

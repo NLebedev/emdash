@@ -4,6 +4,7 @@ export type GitStatusChange = {
   additions: number;
   deletions: number;
   isStaged: boolean;
+  hasUnstaged: boolean;
   diff?: string;
 };
 
