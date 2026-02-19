@@ -3,9 +3,16 @@ import path from 'path';
 import { log } from '../lib/logger';
 import type { LifecyclePhase, LifecycleScriptConfig } from '@shared/lifecycle';
 
+export interface QuickAction {
+  label: string;
+  command: string;
+  autoSubmit?: boolean; // default true; set false to type without pressing Enter
+}
+
 export interface EmdashConfig {
   preservePatterns?: string[];
   scripts?: LifecycleScriptConfig;
+  quickActions?: QuickAction[];
 }
 
 /**

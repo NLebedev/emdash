@@ -22,6 +22,7 @@ import { useAutoScrollOnTaskSwitch } from '@/hooks/useAutoScrollOnTaskSwitch';
 import { TaskScopeProvider } from './TaskScopeContext';
 import { CreateChatModal } from './CreateChatModal';
 import { DeleteChatModal } from './DeleteChatModal';
+import { QuickActions } from './QuickActions';
 import { type Conversation } from '../../main/services/DatabaseService';
 import { terminalSessionRegistry } from '../terminal/SessionRegistry';
 import { getTaskEnvVars } from '@shared/task/envVars';
@@ -1103,6 +1104,13 @@ const ChatInterface: React.FC<Props> = ({
               )}
             </div>
           </div>
+          {projectPath && (
+            <div className="px-6 pb-2 pt-2">
+              <div className="mx-auto max-w-4xl">
+                <QuickActions projectPath={projectPath} terminalId={terminalId} />
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </TaskScopeProvider>
