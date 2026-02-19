@@ -98,9 +98,11 @@ const AppContent: React.FC = () => {
     showCloneModal,
     showEditorMode,
     showKanban,
+    showTaskGrid,
     showDeviceFlowModal,
     setShowEditorMode,
     setShowKanban,
+    setShowTaskGrid,
     setShowTaskModal,
     setShowNewProjectModal,
     setShowCloneModal,
@@ -544,8 +546,9 @@ const AppContent: React.FC = () => {
                   onToggleKanban={handleTitlebarKanbanToggle}
                   isKanbanOpen={Boolean(showKanban)}
                   kanbanAvailable={Boolean(selectedProject)}
+                  isTaskGridOpen={Boolean(showTaskGrid)}
                   onToggleEditor={handleTitlebarEditorToggle}
-                  showEditorButton={Boolean(activeTask)}
+                  showEditorButton={Boolean(activeTask) && !showTaskGrid}
                   isEditorOpen={showEditorMode}
                   projects={projectMgmt.projects}
                   selectedProject={selectedProject}
@@ -615,10 +618,12 @@ const AppContent: React.FC = () => {
                   >
                     <div className="flex h-full flex-col overflow-hidden bg-background text-foreground">
                       <MainContentArea
+                        projects={projectMgmt.projects}
                         selectedProject={selectedProject}
                         activeTask={activeTask}
                         activeTaskAgent={activeTaskAgent}
                         showKanban={showKanban}
+                        showTaskGrid={showTaskGrid}
                         showHomeView={projectMgmt.showHomeView}
                         showSkillsView={projectMgmt.showSkillsView}
                         showSettingsPage={showSettingsPage}
@@ -628,6 +633,7 @@ const AppContent: React.FC = () => {
                         projectBranchOptions={projectMgmt.projectBranchOptions}
                         isLoadingBranches={projectMgmt.isLoadingBranches}
                         setProjectDefaultBranch={projectMgmt.setProjectDefaultBranch}
+                        handleSelectProject={projectMgmt.handleSelectProject}
                         handleSelectTask={taskMgmt.handleSelectTask}
                         handleDeleteTask={taskMgmt.handleDeleteTask}
                         handleArchiveTask={taskMgmt.handleArchiveTask}
@@ -638,6 +644,7 @@ const AppContent: React.FC = () => {
                         handleAddRemoteProject={handleAddRemoteProjectClick}
                         setShowTaskModal={(show: boolean) => setShowTaskModal(show)}
                         setShowKanban={(show: boolean) => setShowKanban(show)}
+                        setShowTaskGrid={(show: boolean) => setShowTaskGrid(show)}
                         projectRemoteConnectionId={derivedRemoteConnectionId}
                         projectRemotePath={derivedRemotePath}
                       />
