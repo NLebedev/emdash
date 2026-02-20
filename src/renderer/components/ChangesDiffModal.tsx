@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { X, Copy, Check, Plus, Minus, Loader2 } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
@@ -69,7 +69,7 @@ type MonacoLineChange = {
 
 type MonacoDecoration = monaco.editor.IModelDeltaDecoration;
 
-function buildDiffSignDecorations(diffLines: DiffLine[]): MonacoDecoration[] {
+function buildDiffLineSignMap(diffLines: DiffLine[]): Map<number, '+' | '-' | '+/-'> {
   const addedLines = new Set<number>();
   const deletedAnchorLines = new Set<number>();
   let modifiedLineNumber = 1;
@@ -86,40 +86,54 @@ function buildDiffSignDecorations(diffLines: DiffLine[]): MonacoDecoration[] {
       continue;
     }
 
-    // Deleted lines are not present in the modified model.
-    // Anchor the "-" marker to the next visible modified line.
     deletedAnchorLines.add(Math.max(1, modifiedLineNumber));
   }
 
-  const decorations: MonacoDecoration[] = [];
+  const signs = new Map<number, '+' | '-' | '+/-'>();
   for (const lineNumber of addedLines) {
-    decorations.push({
-      range: {
-        startLineNumber: lineNumber,
-        startColumn: 1,
-        endLineNumber: lineNumber,
-        endColumn: 1,
-      },
-      options: {
-        isWholeLine: false,
-        linesDecorationsClassName: 'diff-line-sign-add',
-      },
-    });
+    signs.set(lineNumber, '+');
+  }
+  for (const lineNumber of deletedAnchorLines) {
+    const existing = signs.get(lineNumber);
+    signs.set(lineNumber, existing === '+' ? '+/-' : '-');
   }
 
-  for (const lineNumber of deletedAnchorLines) {
-    decorations.push({
-      range: {
-        startLineNumber: lineNumber,
-        startColumn: 1,
-        endLineNumber: lineNumber,
-        endColumn: 1,
-      },
-      options: {
-        isWholeLine: false,
-        linesDecorationsClassName: 'diff-line-sign-del',
-      },
-    });
+  return signs;
+}
+
+function buildDiffSignDecorations(diffLines: DiffLine[]): MonacoDecoration[] {
+  const lineSigns = buildDiffLineSignMap(diffLines);
+
+  const decorations: MonacoDecoration[] = [];
+  for (const [lineNumber, sign] of lineSigns) {
+    if (sign.includes('+')) {
+      decorations.push({
+        range: {
+          startLineNumber: lineNumber,
+          startColumn: 1,
+          endLineNumber: lineNumber,
+          endColumn: 1,
+        },
+        options: {
+          isWholeLine: false,
+          linesDecorationsClassName: 'diff-line-sign-add',
+        },
+      });
+    }
+    if (sign.includes('-')) {
+      decorations.push({
+        range: {
+          startLineNumber: lineNumber,
+          startColumn: 1,
+          endLineNumber: lineNumber,
+          endColumn: 1,
+        },
+        options: {
+          isWholeLine: false,
+          linesDecorationsClassName: 'diff-line-sign-del',
+        },
+      });
+    }
   }
 
   return decorations;
@@ -314,6 +328,17 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       ? 'unstage'
       : null;
   const isDirty = fileData ? modifiedDraft !== fileData.initialModified : false;
+  const diffLineSigns = useMemo(() => {
+    if (!fileData || fileData.loading || fileData.error) return new Map<number, '+' | '-' | '+/-'>();
+    return buildDiffLineSignMap(fileData.diffLines);
+  }, [fileData]);
+  const lineNumberRenderer = useMemo<monaco.editor.LineNumbersType>(
+    () => (lineNumber: number) => {
+      const marker = diffLineSigns.get(lineNumber);
+      return marker ? `${marker} ${lineNumber}` : String(lineNumber);
+    },
+    [diffLineSigns]
+  );
 
   // Close on escape key
   useEffect(() => {
@@ -1610,8 +1635,8 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
                           minimap: { enabled: false },
                           scrollBeyondLastLine: false,
                           wordWrap: 'on',
-                          lineNumbers: 'on',
-                          lineNumbersMinChars: 2,
+                          lineNumbers: lineNumberRenderer,
+                          lineNumbersMinChars: 5,
                           renderIndicators: true,
                           overviewRulerLanes: 3,
                           renderOverviewRuler: true,

@@ -38,6 +38,7 @@ interface FileDiffData {
   original: string;
   modified: string;
   initialModified: string;
+  diffLines?: DiffLine[];
   language: string;
   loading: boolean;
   error: string | null;
@@ -49,6 +50,35 @@ interface FileDiffData {
   saveError?: string | null;
   isLargeFile?: boolean;
   largeFileReason?: 'line_count' | 'content_size' | 'truncated_read';
+}
+
+function buildDiffLineSignMap(diffLines: DiffLine[]): Map<number, '+' | '-' | '+/-'> {
+  const addedLines = new Set<number>();
+  const deletedAnchorLines = new Set<number>();
+  let modifiedLineNumber = 1;
+
+  for (const line of diffLines) {
+    if (line.type === 'context') {
+      modifiedLineNumber += 1;
+      continue;
+    }
+    if (line.type === 'add') {
+      addedLines.add(modifiedLineNumber);
+      modifiedLineNumber += 1;
+      continue;
+    }
+    deletedAnchorLines.add(Math.max(1, modifiedLineNumber));
+  }
+
+  const signs = new Map<number, '+' | '-' | '+/-'>();
+  for (const lineNumber of addedLines) {
+    signs.set(lineNumber, '+');
+  }
+  for (const lineNumber of deletedAnchorLines) {
+    const existing = signs.get(lineNumber);
+    signs.set(lineNumber, existing === '+' ? '+/-' : '-');
+  }
+  return signs;
 }
 
 export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
@@ -184,6 +214,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
               original: '',
               modified: '',
               initialModified: '',
+              diffLines: [],
               language: 'plaintext',
               loading: true,
               error: null,
@@ -203,6 +234,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                 original: '',
                 modified: '',
                 initialModified: '',
+                diffLines: [],
                 language: 'plaintext',
                 loading: false,
                 error: 'Deleted image - preview unavailable',
@@ -223,6 +255,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                 original: '',
                 modified: '',
                 initialModified: '',
+                diffLines: [],
                 language: 'plaintext',
                 loading: false,
                 error: imageRes?.success && imageRes.dataUrl ? null : imageRes?.error || 'Failed to load image preview',
@@ -241,6 +274,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                 original: '',
                 modified: '',
                 initialModified: '',
+                diffLines: [],
                 language: 'plaintext',
                 loading: false,
                 error: error?.message || 'Failed to load image preview',
@@ -258,6 +292,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
               original: '',
               modified: '',
               initialModified: '',
+              diffLines: [],
               language: 'plaintext',
               loading: false,
               error: 'Binary file - diff not available',
@@ -278,6 +313,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
           original: '',
           modified: '',
           initialModified: '',
+          diffLines: [],
           language,
           loading: true,
           error: null,
@@ -380,6 +416,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
             original: originalContent,
             modified: modifiedContent,
             initialModified: modifiedContent,
+            diffLines,
             language,
             loading: false,
             error: null,
@@ -399,6 +436,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
             original: '',
             modified: '',
             initialModified: '',
+            diffLines: [],
             language,
             loading: false,
             error: error?.message || 'Failed to load file diff',
@@ -652,6 +690,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
           original: '',
           modified: '',
           initialModified: '',
+          diffLines: [],
           language: getMonacoLanguageId(filePath),
           loading: true,
           error: null,
@@ -887,6 +926,13 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                       const hasError = data?.error !== null;
                       const isDirty = data ? data.modified !== data.initialModified : false;
                       const isSaving = data?.saving ?? false;
+                      const diffLineSigns = buildDiffLineSignMap(data?.diffLines ?? []);
+                      const lineNumberRenderer: monaco.editor.LineNumbersType = (
+                        lineNumber: number
+                      ) => {
+                        const marker = diffLineSigns.get(lineNumber);
+                        return marker ? `${marker} ${lineNumber}` : String(lineNumber);
+                      };
 
                       return (
                         <div
@@ -1051,8 +1097,8 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                                       minimap: { enabled: false }, // Disable minimap for cleaner look
                                       scrollBeyondLastLine: false,
                                       wordWrap: 'on',
-                                      lineNumbers: 'on',
-                                      lineNumbersMinChars: 2, // Reduce line number width for better space usage
+                                      lineNumbers: lineNumberRenderer,
+                                      lineNumbersMinChars: 5,
                                       renderIndicators: true,
                                       overviewRulerLanes: 3, // Show overview ruler with change indicators
                                       renderOverviewRuler: true, // Show overview ruler
