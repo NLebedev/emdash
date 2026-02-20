@@ -1090,8 +1090,8 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                                       // Remove extra padding
                                       padding: { top: 8, bottom: 8 },
                                       // Spacing adjustments
-                                      glyphMargin: false, // Disable glyph margin to reduce spacing
-                                      lineDecorationsWidth: 16, // Width for +/- indicators
+                                      glyphMargin: true,
+                                      lineDecorationsWidth: 24,
                                       folding: false, // Disable folding to reduce spacing
                                     }}
                                     onMount={(editor: monaco.editor.IStandaloneDiffEditor) =>

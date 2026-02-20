@@ -56,6 +56,64 @@ type MonacoLineChange = {
   modifiedEndLineNumber: number;
 };
 
+type MonacoDecoration = monaco.editor.IModelDeltaDecoration;
+
+function buildDiffSignDecorations(diffLines: DiffLine[]): MonacoDecoration[] {
+  const addedLines = new Set<number>();
+  const deletedAnchorLines = new Set<number>();
+  let modifiedLineNumber = 1;
+
+  for (const line of diffLines) {
+    if (line.type === 'context') {
+      modifiedLineNumber += 1;
+      continue;
+    }
+
+    if (line.type === 'add') {
+      addedLines.add(modifiedLineNumber);
+      modifiedLineNumber += 1;
+      continue;
+    }
+
+    // Deleted lines are not present in the modified model.
+    // Anchor the "-" marker to the next visible modified line.
+    deletedAnchorLines.add(Math.max(1, modifiedLineNumber));
+  }
+
+  const decorations: MonacoDecoration[] = [];
+  for (const lineNumber of addedLines) {
+    decorations.push({
+      range: {
+        startLineNumber: lineNumber,
+        startColumn: 1,
+        endLineNumber: lineNumber,
+        endColumn: 1,
+      },
+      options: {
+        isWholeLine: false,
+        linesDecorationsClassName: 'diff-line-sign-add',
+      },
+    });
+  }
+
+  for (const lineNumber of deletedAnchorLines) {
+    decorations.push({
+      range: {
+        startLineNumber: lineNumber,
+        startColumn: 1,
+        endLineNumber: lineNumber,
+        endColumn: 1,
+      },
+      options: {
+        isWholeLine: false,
+        linesDecorationsClassName: 'diff-line-sign-del',
+      },
+    });
+  }
+
+  return decorations;
+}
+
 function splitLines(text: string): string[] {
   return text.length === 0 ? [] : text.split('\n');
 }
@@ -197,6 +255,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
   const diffUpdateDisposableRef = useRef<monaco.IDisposable | null>(null);
   const stageClickDisposableRef = useRef<monaco.IDisposable | null>(null);
   const stageDecorationIdsRef = useRef<string[]>([]);
+  const diffSignDecorationIdsRef = useRef<string[]>([]);
   const activeEditorCleanupRef = useRef<(() => void) | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [decorationNonce, setDecorationNonce] = useState(0);
@@ -669,6 +728,27 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       .${UNSTAGE_CHANGE_GLYPH_CLASS}:hover::before {
         color: hsl(0 72% 38%);
       }
+      .diff-line-sign-add::before,
+      .diff-line-sign-del::before {
+        position: absolute;
+        left: 1px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 10px;
+        height: 12px;
+        line-height: 12px;
+        text-align: center;
+        font-size: 11px;
+        font-weight: 700;
+      }
+      .diff-line-sign-add::before {
+        content: '+';
+        color: hsl(142 76% 36%);
+      }
+      .diff-line-sign-del::before {
+        content: '-';
+        color: hsl(0 72% 45%);
+      }
       /* Remove any borders from glyph margin items */
       .monaco-editor .glyph-margin > div {
         border: none !important;
@@ -785,6 +865,11 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
           // ignore
         }
         try {
+          currentEditor.getModifiedEditor().deltaDecorations(diffSignDecorationIdsRef.current, []);
+        } catch {
+          // ignore
+        }
+        try {
           currentEditor.dispose();
         } catch {
           // Ignore disposal errors
@@ -816,6 +901,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       }
       activeEditorCleanupRef.current = null;
       stageDecorationIdsRef.current = [];
+      diffSignDecorationIdsRef.current = [];
 
       // Reset diagnostic options when closing modal
       loader
@@ -967,6 +1053,34 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       // ignore decoration errors
     }
   }, [editorInstance, fileData, selectedBlockAction, decorationNonce]);
+
+  useEffect(() => {
+    const diffEditor = editorInstance ?? editorRef.current;
+    if (!diffEditor) return;
+
+    const modifiedEditor = diffEditor.getModifiedEditor();
+    if (!fileData || fileData.loading || fileData.error) {
+      try {
+        diffSignDecorationIdsRef.current = modifiedEditor.deltaDecorations(
+          diffSignDecorationIdsRef.current,
+          []
+        );
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    const signDecorations = buildDiffSignDecorations(fileData.diffLines);
+    try {
+      diffSignDecorationIdsRef.current = modifiedEditor.deltaDecorations(
+        diffSignDecorationIdsRef.current,
+        signDecorations
+      );
+    } catch {
+      // ignore
+    }
+  }, [editorInstance, fileData, decorationNonce]);
 
   useEffect(() => {
     const diffEditor = editorInstance ?? editorRef.current;
@@ -1509,7 +1623,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
                           cursorSmoothCaretAnimation: 'on',
                           padding: { top: 8, bottom: 8 },
                           glyphMargin: true,
-                          lineDecorationsWidth: 16,
+                          lineDecorationsWidth: 24,
                           folding: false,
                           renderMarginRevertIcon: false,
                         }}
