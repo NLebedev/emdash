@@ -597,13 +597,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       .monaco-diff-editor .monaco-editor .margin {
         padding-right: 8px !important;
       }
-      /* Hide left/original line numbers in unified diff view */
-      .monaco-diff-editor .original .line-numbers {
-        display: none !important;
-      }
-      .monaco-diff-editor .original .margin {
-        display: none !important;
-      }
+      /* Keep both original/modified gutters visible so Monaco diff indicators remain visible. */
       /* Make overview ruler thinner */
       .monaco-diff-editor .monaco-editor .overview-ruler {
         width: 3px !important;
@@ -728,10 +722,18 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
       .${UNSTAGE_CHANGE_GLYPH_CLASS}:hover::before {
         color: hsl(0 72% 38%);
       }
+      .diff-line-sign-add,
+      .diff-line-sign-del {
+        position: relative !important;
+        display: block !important;
+        width: 12px !important;
+        pointer-events: none !important;
+      }
       .diff-line-sign-add::before,
       .diff-line-sign-del::before {
+        display: block;
         position: absolute;
-        left: 1px;
+        left: 0;
         top: 50%;
         transform: translateY(-50%);
         width: 10px;
@@ -740,6 +742,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
         text-align: center;
         font-size: 11px;
         font-weight: 700;
+        z-index: 5;
       }
       .diff-line-sign-add::before {
         content: '+';
@@ -1623,7 +1626,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
                           cursorSmoothCaretAnimation: 'on',
                           padding: { top: 8, bottom: 8 },
                           glyphMargin: true,
-                          lineDecorationsWidth: 24,
+                          lineDecorationsWidth: 28,
                           folding: false,
                           renderMarginRevertIcon: false,
                         }}

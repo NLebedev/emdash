@@ -491,13 +491,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
         padding-left: 4px !important;
         min-width: 40px !important;
       }
-      /* Hide left/original line numbers in unified diff view */
-      .monaco-diff-editor .original .line-numbers {
-        display: none !important;
-      }
-      .monaco-diff-editor .original .margin {
-        display: none !important;
-      }
+      /* Keep both original/modified gutters visible so Monaco diff indicators remain visible. */
       /* Make overview ruler thinner */
       .monaco-diff-editor .monaco-editor .overview-ruler {
         width: 3px !important;
@@ -1091,7 +1085,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                                       padding: { top: 8, bottom: 8 },
                                       // Spacing adjustments
                                       glyphMargin: true,
-                                      lineDecorationsWidth: 24,
+                                      lineDecorationsWidth: 28,
                                       folding: false, // Disable folding to reduce spacing
                                     }}
                                     onMount={(editor: monaco.editor.IStandaloneDiffEditor) =>
