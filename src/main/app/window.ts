@@ -5,6 +5,12 @@ import { registerExternalLinkHandlers } from '../utils/externalLinks';
 import { ensureRendererServer } from './staticServer';
 
 let mainWindow: BrowserWindow | null = null;
+const E2E_DIFF_SMOKE_HASH = '/e2e/diff-smoke';
+
+function appendHash(url: string, hashPath?: string | null): string {
+  if (!hashPath) return url;
+  return `${url}#${hashPath}`;
+}
 
 export function createMainWindow(): BrowserWindow {
   // In development, resolve icon from src/assets
@@ -34,21 +40,27 @@ export function createMainWindow(): BrowserWindow {
     show: false,
   });
 
+  const e2eHashPath = process.argv.includes('--e2e-diff-smoke') ? E2E_DIFF_SMOKE_HASH : null;
+
   if (isDev) {
-    mainWindow.loadURL('http://localhost:3000');
+    mainWindow.loadURL(appendHash('http://localhost:3000', e2eHashPath));
   } else {
     // Serve renderer over an HTTP origin in production so embeds work.
     const rendererRoot = join(__dirname, '..', '..', '..', 'renderer');
     void ensureRendererServer(rendererRoot)
       .then((url: string) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.loadURL(url);
+          mainWindow.loadURL(appendHash(url, e2eHashPath));
         }
       })
       .catch(() => {
         // Fallback to file load if server fails for any reason.
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.loadFile(join(rendererRoot, 'index.html'));
+          if (e2eHashPath) {
+            mainWindow.loadFile(join(rendererRoot, 'index.html'), { hash: e2eHashPath });
+          } else {
+            mainWindow.loadFile(join(rendererRoot, 'index.html'));
+          }
         }
       });
   }

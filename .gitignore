@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+.pnpm-store/
 dist/
 release/
 
@@ -17,6 +18,8 @@ pids
 
 # Coverage directory used by tools like istanbul
 coverage/
+test-results/
+playwright-report/
 
 # nyc test coverage
 .nyc_output

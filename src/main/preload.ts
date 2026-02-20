@@ -287,7 +287,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       gitStatusChangedListeners.delete(listener);
     };
   },
-  getFileDiff: (args: { taskPath: string; filePath: string }) =>
+  getFileDiff: (args: {
+    taskPath: string;
+    filePath: string;
+    scope?: 'all' | 'staged' | 'unstaged';
+  }) =>
     ipcRenderer.invoke('git:get-file-diff', args),
   stageFile: (args: { taskPath: string; filePath: string }) =>
     ipcRenderer.invoke('git:stage-file', args),
@@ -298,6 +302,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     startLine: number;
     endLine: number;
   }) => ipcRenderer.invoke('git:stage-diff-range', args),
+  unstageDiffRange: (args: {
+    taskPath: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+  }) => ipcRenderer.invoke('git:unstage-diff-range', args),
   unstageFile: (args: { taskPath: string; filePath: string }) =>
     ipcRenderer.invoke('git:unstage-file', args),
   revertFile: (args: { taskPath: string; filePath: string }) =>
@@ -308,6 +318,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     createBranchIfOnDefault?: boolean;
     branchPrefix?: string;
   }) => ipcRenderer.invoke('git:commit-and-push', args),
+  generateCommitMessage: (args: { taskPath: string }) =>
+    ipcRenderer.invoke('git:generate-commit-message', args),
   generatePrContent: (args: { taskPath: string; base?: string }) =>
     ipcRenderer.invoke('git:generate-pr-content', args),
   createPullRequest: (args: {
@@ -826,6 +838,10 @@ export interface ElectronAPI {
       deletions: number;
       isStaged: boolean;
       hasUnstaged: boolean;
+      stagedAdditions: number;
+      stagedDeletions: number;
+      unstagedAdditions: number;
+      unstagedDeletions: number;
       diff?: string;
     }>;
     error?: string;
@@ -845,7 +861,11 @@ export interface ElectronAPI {
   onGitStatusChanged: (
     listener: (data: { taskPath: string; error?: string }) => void
   ) => () => void;
-  getFileDiff: (args: { taskPath: string; filePath: string }) => Promise<{
+  getFileDiff: (args: {
+    taskPath: string;
+    filePath: string;
+    scope?: 'all' | 'staged' | 'unstaged';
+  }) => Promise<{
     success: boolean;
     diff?: { lines: Array<{ left?: string; right?: string; type: 'context' | 'add' | 'del' }> };
     error?: string;
@@ -856,12 +876,25 @@ export interface ElectronAPI {
     startLine: number;
     endLine: number;
   }) => Promise<{ success: boolean; staged?: boolean; stagedHunks?: number; error?: string }>;
+  unstageDiffRange: (args: {
+    taskPath: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+  }) => Promise<{ success: boolean; unstaged?: boolean; unstagedHunks?: number; error?: string }>;
   gitCommitAndPush: (args: {
     taskPath: string;
     commitMessage?: string;
     createBranchIfOnDefault?: boolean;
     branchPrefix?: string;
   }) => Promise<{ success: boolean; branch?: string; output?: string; error?: string }>;
+  generateCommitMessage: (args: { taskPath: string }) => Promise<{
+    success: boolean;
+    message?: string;
+    providerId?: string;
+    source?: 'provider' | 'heuristic';
+    error?: string;
+  }>;
   createPullRequest: (args: {
     taskPath: string;
     title?: string;

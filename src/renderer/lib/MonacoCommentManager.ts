@@ -69,6 +69,11 @@ export class MonacoCommentManager {
     this.hoverMoveDisposable = modifiedEditor.onMouseMove((e) => {
       if (this.disposed) return;
       const targetElement = e.target.element as HTMLElement | null;
+      if (targetElement?.closest?.('.stage-change-glyph, .unstage-change-glyph')) {
+        this.clearHoverDecoration();
+        this.hoveredLine = null;
+        return;
+      }
       if (targetElement?.closest?.('.comment-view-zone')) {
         this.clearHoverDecoration();
         this.hoveredLine = null;
@@ -81,6 +86,11 @@ export class MonacoCommentManager {
       const lineNumber = e.target.position?.lineNumber;
 
       if (lineNumber && lineNumber !== this.hoveredLine) {
+        if (this.hasStageGlyphDecoration(lineNumber)) {
+          this.clearHoverDecoration();
+          this.hoveredLine = lineNumber;
+          return;
+        }
         if (lineNumber === this.activeInputLine) {
           this.clearHoverDecoration();
           this.hoveredLine = lineNumber;
@@ -100,6 +110,15 @@ export class MonacoCommentManager {
       if (this.disposed) return;
       this.clearHoverDecoration();
       this.hoveredLine = null;
+    });
+  }
+
+  private hasStageGlyphDecoration(lineNumber: number): boolean {
+    const modifiedEditor = this.editor.getModifiedEditor();
+    const lineDecorations = modifiedEditor.getLineDecorations(lineNumber) ?? [];
+    return lineDecorations.some((decoration) => {
+      const className = decoration.options.glyphMarginClassName || '';
+      return className.includes('stage-change-glyph') || className.includes('unstage-change-glyph');
     });
   }
 

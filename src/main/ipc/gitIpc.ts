@@ -12,6 +12,7 @@ import {
   stageFile as gitStageFile,
   stageAllFiles as gitStageAllFiles,
   stageDiffRange as gitStageDiffRange,
+  unstageDiffRange as gitUnstageDiffRange,
   unstageFile as gitUnstageFile,
   revertFile as gitRevertFile,
 } from '../services/GitService';
@@ -99,6 +100,19 @@ const releaseGitStatusWatcher = (taskPath: string, watchId?: string) => {
   return { success: true as const };
 };
 
+const resolveTaskProviderId = async (taskPath: string): Promise<string | null> => {
+  try {
+    const task = await databaseService.getTaskByPath(taskPath);
+    if (task?.agentId) {
+      log.debug('Found task provider for generation request', { taskPath, providerId: task.agentId });
+      return task.agentId;
+    }
+  } catch (error) {
+    log.debug('Could not lookup task provider', { error });
+  }
+  return null;
+};
+
 export function registerGitIpc() {
   function resolveGitBin(): string {
     // Allow override via env
@@ -138,14 +152,20 @@ export function registerGitIpc() {
   });
 
   // Git: Per-file diff (moved from Codex IPC)
-  ipcMain.handle('git:get-file-diff', async (_, args: { taskPath: string; filePath: string }) => {
-    try {
-      const diff = await gitGetFileDiff(args.taskPath, args.filePath);
-      return { success: true, diff };
-    } catch (error) {
-      return { success: false, error: error as string };
+  ipcMain.handle(
+    'git:get-file-diff',
+    async (
+      _,
+      args: { taskPath: string; filePath: string; scope?: 'all' | 'staged' | 'unstaged' }
+    ) => {
+      try {
+        const diff = await gitGetFileDiff(args.taskPath, args.filePath, args.scope ?? 'all');
+        return { success: true, diff };
+      } catch (error) {
+        return { success: false, error: error as string };
+      }
     }
-  });
+  );
 
   // Git: Stage file
   ipcMain.handle('git:stage-file', async (_, args: { taskPath: string; filePath: string }) => {
@@ -206,6 +226,39 @@ export function registerGitIpc() {
     }
   );
 
+  // Git: Unstage selected diff range (partial unstaging)
+  ipcMain.handle(
+    'git:unstage-diff-range',
+    async (
+      _,
+      args: { taskPath: string; filePath: string; startLine: number; endLine: number }
+    ) => {
+      try {
+        log.info('Unstaging diff range:', {
+          taskPath: args.taskPath,
+          filePath: args.filePath,
+          startLine: args.startLine,
+          endLine: args.endLine,
+        });
+        const result = await gitUnstageDiffRange(
+          args.taskPath,
+          args.filePath,
+          args.startLine,
+          args.endLine
+        );
+        return { success: true, ...result };
+      } catch (error) {
+        log.error('Failed to unstage diff range:', {
+          filePath: args.filePath,
+          startLine: args.startLine,
+          endLine: args.endLine,
+          error,
+        });
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  );
+
   // Git: Unstage file
   ipcMain.handle('git:unstage-file', async (_, args: { taskPath: string; filePath: string }) => {
     try {
@@ -243,23 +296,35 @@ export function registerGitIpc() {
     ) => {
       const { taskPath, base = 'main' } = args || ({} as { taskPath: string; base?: string });
       try {
-        // Try to get the task to find which provider was used
-        let providerId: string | null = null;
-        try {
-          const task = await databaseService.getTaskByPath(taskPath);
-          if (task?.agentId) {
-            providerId = task.agentId;
-            log.debug('Found task provider for PR generation', { taskPath, providerId });
-          }
-        } catch (error) {
-          log.debug('Could not lookup task provider', { error });
-          // Non-fatal - continue without provider
-        }
-
+        const providerId = await resolveTaskProviderId(taskPath);
         const result = await prGenerationService.generatePrContent(taskPath, base, providerId);
         return { success: true, ...result };
       } catch (error) {
         log.error('Failed to generate PR content:', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+  );
+
+  // Git: Generate commit message from staged changes using the task's provider
+  ipcMain.handle(
+    'git:generate-commit-message',
+    async (
+      _,
+      args: {
+        taskPath: string;
+      }
+    ) => {
+      const { taskPath } = args || ({} as { taskPath: string });
+      try {
+        const providerId = await resolveTaskProviderId(taskPath);
+        const result = await prGenerationService.generateCommitMessage(taskPath, providerId);
+        return { success: true, ...result };
+      } catch (error) {
+        log.error('Failed to generate commit message:', error);
         return {
           success: false,
           error: error instanceof Error ? error.message : String(error),

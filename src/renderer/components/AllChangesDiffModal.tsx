@@ -10,6 +10,7 @@ import {
   convertDiffLinesToMonacoFormat,
   getMonacoLanguageId,
   isBinaryFile,
+  isImageFile,
 } from '../lib/diffUtils';
 import { dispatchFileChangeEvent } from '../lib/fileChangeEvents';
 import { useToast } from '../hooks/use-toast';
@@ -37,14 +38,47 @@ interface FileDiffData {
   original: string;
   modified: string;
   initialModified: string;
+  diffLines?: DiffLine[];
   language: string;
   loading: boolean;
   error: string | null;
+  isImage?: boolean;
+  imageDataUrl?: string;
+  imageMimeType?: string;
   expanded: boolean;
   saving?: boolean;
   saveError?: string | null;
   isLargeFile?: boolean;
   largeFileReason?: 'line_count' | 'content_size' | 'truncated_read';
+}
+
+function buildDiffLineSignMap(diffLines: DiffLine[]): Map<number, '+' | '-' | '+/-'> {
+  const addedLines = new Set<number>();
+  const deletedAnchorLines = new Set<number>();
+  let modifiedLineNumber = 1;
+
+  for (const line of diffLines) {
+    if (line.type === 'context') {
+      modifiedLineNumber += 1;
+      continue;
+    }
+    if (line.type === 'add') {
+      addedLines.add(modifiedLineNumber);
+      modifiedLineNumber += 1;
+      continue;
+    }
+    deletedAnchorLines.add(Math.max(1, modifiedLineNumber));
+  }
+
+  const signs = new Map<number, '+' | '-' | '+/-'>();
+  for (const lineNumber of addedLines) {
+    signs.set(lineNumber, '+');
+  }
+  for (const lineNumber of deletedAnchorLines) {
+    const existing = signs.get(lineNumber);
+    signs.set(lineNumber, existing === '+' ? '+/-' : '-');
+  }
+  return signs;
 }
 
 export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
@@ -171,22 +205,104 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
       const totalLineChanges = file.additions + file.deletions;
       const isLargeByLineCount = totalLineChanges > LARGE_DIFF_LINE_THRESHOLD;
 
-      // Skip binary files
+      // Binary files: preview images, otherwise show placeholder error
       if (isBinaryFile(filePath)) {
-        setFileData((prev) => {
-          const next = new Map(prev);
-          next.set(filePath, {
-            original: '',
-            modified: '',
-            initialModified: '',
-            language: 'plaintext',
-            loading: false,
-            error: 'Binary file - diff not available',
-            expanded: true, // Default expanded
-            isLargeFile: false,
+        if (isImageFile(filePath)) {
+          setFileData((prev) => {
+            const next = new Map(prev);
+            next.set(filePath, {
+              original: '',
+              modified: '',
+              initialModified: '',
+              diffLines: [],
+              language: 'plaintext',
+              loading: true,
+              error: null,
+              isImage: true,
+              imageDataUrl: undefined,
+              imageMimeType: undefined,
+              expanded: true,
+              isLargeFile: false,
+            });
+            return next;
           });
-          return next;
-        });
+
+          if (file.status === 'deleted') {
+            setFileData((prev) => {
+              const next = new Map(prev);
+              next.set(filePath, {
+                original: '',
+                modified: '',
+                initialModified: '',
+                diffLines: [],
+                language: 'plaintext',
+                loading: false,
+                error: 'Deleted image - preview unavailable',
+                isImage: true,
+                expanded: true,
+                isLargeFile: false,
+              });
+              return next;
+            });
+            return;
+          }
+
+          try {
+            const imageRes = await window.electronAPI.fsReadImage(resolvedTaskPath, filePath);
+            setFileData((prev) => {
+              const next = new Map(prev);
+              next.set(filePath, {
+                original: '',
+                modified: '',
+                initialModified: '',
+                diffLines: [],
+                language: 'plaintext',
+                loading: false,
+                error: imageRes?.success && imageRes.dataUrl ? null : imageRes?.error || 'Failed to load image preview',
+                isImage: true,
+                imageDataUrl: imageRes?.success ? imageRes.dataUrl : undefined,
+                imageMimeType: imageRes?.success ? imageRes.mimeType : undefined,
+                expanded: true,
+                isLargeFile: false,
+              });
+              return next;
+            });
+          } catch (error: any) {
+            setFileData((prev) => {
+              const next = new Map(prev);
+              next.set(filePath, {
+                original: '',
+                modified: '',
+                initialModified: '',
+                diffLines: [],
+                language: 'plaintext',
+                loading: false,
+                error: error?.message || 'Failed to load image preview',
+                isImage: true,
+                expanded: true,
+                isLargeFile: false,
+              });
+              return next;
+            });
+          }
+        } else {
+          setFileData((prev) => {
+            const next = new Map(prev);
+            next.set(filePath, {
+              original: '',
+              modified: '',
+              initialModified: '',
+              diffLines: [],
+              language: 'plaintext',
+              loading: false,
+              error: 'Binary file - diff not available',
+              isImage: false,
+              expanded: true, // Default expanded
+              isLargeFile: false,
+            });
+            return next;
+          });
+        }
         return;
       }
 
@@ -197,9 +313,13 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
           original: '',
           modified: '',
           initialModified: '',
+          diffLines: [],
           language,
           loading: true,
           error: null,
+          isImage: false,
+          imageDataUrl: undefined,
+          imageMimeType: undefined,
           expanded: !isLargeByLineCount, // Collapse large files by default
           isLargeFile: isLargeByLineCount,
           largeFileReason: isLargeByLineCount ? 'line_count' : undefined,
@@ -296,9 +416,13 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
             original: originalContent,
             modified: modifiedContent,
             initialModified: modifiedContent,
+            diffLines,
             language,
             loading: false,
             error: null,
+            isImage: false,
+            imageDataUrl: undefined,
+            imageMimeType: undefined,
             expanded: !isLargeFile, // Collapse large files by default
             isLargeFile,
             largeFileReason,
@@ -312,9 +436,13 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
             original: '',
             modified: '',
             initialModified: '',
+            diffLines: [],
             language,
             loading: false,
             error: error?.message || 'Failed to load file diff',
+            isImage: false,
+            imageDataUrl: undefined,
+            imageMimeType: undefined,
             expanded: !isLargeByLineCount, // Collapse large files even on error
             isLargeFile: isLargeByLineCount,
             largeFileReason: isLargeByLineCount ? 'line_count' : undefined,
@@ -401,30 +529,13 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
         padding-left: 4px !important;
         min-width: 40px !important;
       }
-      /* Hide left/original line numbers in unified diff view */
-      .monaco-diff-editor .original .line-numbers {
-        display: none !important;
-      }
-      .monaco-diff-editor .original .margin {
-        display: none !important;
-      }
+      /* Keep both original/modified gutters visible so Monaco diff indicators remain visible. */
       /* Make overview ruler thinner */
       .monaco-diff-editor .monaco-editor .overview-ruler {
         width: 3px !important;
       }
       .monaco-diff-editor .monaco-editor .overview-ruler .overview-ruler-content {
         width: 3px !important;
-      }
-      /* Hide +/- indicators on the left sidebar - multiple selectors to ensure they're hidden */
-      .monaco-diff-editor .margin-view-overlays .line-insert,
-      .monaco-diff-editor .margin-view-overlays .line-delete,
-      .monaco-diff-editor .margin-view-overlays .codicon-add,
-      .monaco-diff-editor .margin-view-overlays .codicon-remove,
-      .monaco-diff-editor .margin-view-overlays .codicon-diff-added,
-      .monaco-diff-editor .margin-view-overlays .codicon-diff-removed {
-        display: none !important;
-        visibility: hidden !important;
-        opacity: 0 !important;
       }
       /* Add thin border between line numbers and code content */
       .monaco-diff-editor .modified .margin-view-overlays {
@@ -579,6 +690,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
           original: '',
           modified: '',
           initialModified: '',
+          diffLines: [],
           language: getMonacoLanguageId(filePath),
           loading: true,
           error: null,
@@ -814,6 +926,13 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                       const hasError = data?.error !== null;
                       const isDirty = data ? data.modified !== data.initialModified : false;
                       const isSaving = data?.saving ?? false;
+                      const diffLineSigns = buildDiffLineSignMap(data?.diffLines ?? []);
+                      const lineNumberRenderer: monaco.editor.LineNumbersType = (
+                        lineNumber: number
+                      ) => {
+                        const marker = diffLineSigns.get(lineNumber);
+                        return marker ? `${marker} ${lineNumber}` : String(lineNumber);
+                      };
 
                       return (
                         <div
@@ -910,6 +1029,23 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                                     {data?.error || 'Failed to load diff'}
                                   </span>
                                 </div>
+                              ) : data?.isImage ? (
+                                <div className="flex h-64 items-center justify-center overflow-auto bg-muted/20 p-4">
+                                  {data.imageDataUrl ? (
+                                    <img
+                                      src={data.imageDataUrl}
+                                      alt={file.path}
+                                      className="max-h-full max-w-full rounded-md border border-border bg-background object-contain shadow-sm"
+                                    />
+                                  ) : (
+                                    <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-muted-foreground">
+                                      <AlertCircle className="h-6 w-6 text-rose-500 dark:text-rose-400" />
+                                      <span className="text-sm">
+                                        {data.error || 'Image preview unavailable'}
+                                      </span>
+                                    </div>
+                                  )}
+                                </div>
                               ) : data?.isLargeFile ? (
                                 <div className="flex h-64 flex-col items-center justify-center gap-4 px-4 text-muted-foreground">
                                   <div className="flex flex-col items-center gap-2">
@@ -961,9 +1097,9 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                                       minimap: { enabled: false }, // Disable minimap for cleaner look
                                       scrollBeyondLastLine: false,
                                       wordWrap: 'on',
-                                      lineNumbers: 'on',
-                                      lineNumbersMinChars: 2, // Reduce line number width for better space usage
-                                      renderIndicators: false, // Hide +/- indicators
+                                      lineNumbers: lineNumberRenderer,
+                                      lineNumbersMinChars: 5,
+                                      renderIndicators: true,
                                       overviewRulerLanes: 3, // Show overview ruler with change indicators
                                       renderOverviewRuler: true, // Show overview ruler
                                       automaticLayout: true,
@@ -994,8 +1130,8 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                                       // Remove extra padding
                                       padding: { top: 8, bottom: 8 },
                                       // Spacing adjustments
-                                      glyphMargin: false, // Disable glyph margin to reduce spacing
-                                      lineDecorationsWidth: 16, // Width for +/- indicators
+                                      glyphMargin: true,
+                                      lineDecorationsWidth: 28,
                                       folding: false, // Disable folding to reduce spacing
                                     }}
                                     onMount={(editor: monaco.editor.IStandaloneDiffEditor) =>

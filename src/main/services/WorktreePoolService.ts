@@ -1,12 +1,9 @@
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { log } from '../lib/logger';
 import { worktreeService, type WorktreeInfo } from './WorktreeService';
-
-const execFileAsync = promisify(execFile);
+import { execGit as execGitCommand } from '../utils/gitExec';
 
 interface ReserveWorktree {
   id: string;
@@ -39,6 +36,25 @@ export class WorktreePoolService {
   // Reserves older than this are considered stale and will be recreated
   // 30 minutes is reasonable since users don't create tasks that frequently
   private readonly MAX_RESERVE_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
+  private async execGit(
+    args: string[],
+    cwd: string,
+    timeout?: number
+  ): Promise<{
+    stdout: string;
+    stderr: string;
+  }> {
+    return execGitCommand(args, cwd, {
+      timeout,
+      onRetryOversizedEnv: (code) => {
+        log.warn('WorktreePool: git spawn failed with oversized env, retrying with minimal env', {
+          cwd,
+          code,
+        });
+      },
+    });
+  }
 
   /** Generate a unique hash for reserve identification */
   private generateReserveHash(): string {
@@ -141,9 +157,7 @@ export class WorktreePoolService {
     // The worktree will use local refs which is fine for pre-warming purposes
 
     // Create the worktree
-    await execFileAsync('git', ['worktree', 'add', '-b', reserveBranch, reservePath, useBaseRef], {
-      cwd: projectPath,
-    });
+    await this.execGit(['worktree', 'add', '-b', reserveBranch, reservePath, useBaseRef], projectPath);
 
     const reserveId = this.stableIdFromPath(reservePath);
     const reserve: ReserveWorktree = {
@@ -222,9 +236,7 @@ export class WorktreePoolService {
         (!requestedBaseRef || requestedBaseRef === reserve.baseRef || requestedBaseRef === 'HEAD')
       ) {
         try {
-          await execFileAsync('git', ['reset', '--hard', fetchedRef], {
-            cwd: result.worktree.path,
-          });
+          await this.execGit(['reset', '--hard', fetchedRef], result.worktree.path);
         } catch (error) {
           log.warn('WorktreePool: Failed to reset to fetched ref', { error });
         }
@@ -262,17 +274,13 @@ export class WorktreePoolService {
     const newId = this.stableIdFromPath(newPath);
 
     // Move the worktree (instant operation)
-    await execFileAsync('git', ['worktree', 'move', reserve.path, newPath], {
-      cwd: reserve.projectPath,
-    });
+    await this.execGit(['worktree', 'move', reserve.path, newPath], reserve.projectPath);
 
     // Update reserve path so cleanup uses correct location if we fail later
     reserve.path = newPath;
 
     // Rename the branch (instant operation)
-    await execFileAsync('git', ['branch', '-m', reserve.branch, newBranch], {
-      cwd: newPath,
-    });
+    await this.execGit(['branch', '-m', reserve.branch, newBranch], newPath);
 
     // Check if we need to switch base refs
     let needsBaseRefSwitch = false;
@@ -280,9 +288,7 @@ export class WorktreePoolService {
       needsBaseRefSwitch = true;
       // Do the base ref switch (this might take a moment but is still faster than full creation)
       try {
-        await execFileAsync('git', ['reset', '--hard', requestedBaseRef], {
-          cwd: newPath,
-        });
+        await this.execGit(['reset', '--hard', requestedBaseRef], newPath);
         needsBaseRefSwitch = false; // Successfully switched
       } catch (error) {
         log.warn('WorktreePool: Failed to switch base ref', { error });
@@ -336,9 +342,7 @@ export class WorktreePoolService {
 
     try {
       // Get remote name
-      const { stdout: remotesOut } = await execFileAsync('git', ['remote'], {
-        cwd: worktreePath,
-      });
+      const { stdout: remotesOut } = await this.execGit(['remote'], worktreePath);
       const remotes = remotesOut.trim().split('\n').filter(Boolean);
       const remote = remotes.includes('origin') ? 'origin' : remotes[0];
 
@@ -346,10 +350,7 @@ export class WorktreePoolService {
         return;
       }
 
-      await execFileAsync('git', ['push', '--set-upstream', remote, branchName], {
-        cwd: worktreePath,
-        timeout: 60000,
-      });
+      await this.execGit(['push', '--set-upstream', remote, branchName], worktreePath, 60000);
     } catch {
       // Push failures are non-critical, ignore silently
     }
@@ -358,13 +359,9 @@ export class WorktreePoolService {
   /** Cleanup a reserve worktree */
   private async cleanupReserve(reserve: ReserveWorktree): Promise<void> {
     try {
-      await execFileAsync('git', ['worktree', 'remove', '--force', reserve.path], {
-        cwd: reserve.projectPath,
-      });
+      await this.execGit(['worktree', 'remove', '--force', reserve.path], reserve.projectPath);
       // Also delete the branch
-      await execFileAsync('git', ['branch', '-D', reserve.branch], {
-        cwd: reserve.projectPath,
-      });
+      await this.execGit(['branch', '-D', reserve.branch], reserve.projectPath);
     } catch {
       // Cleanup failures are non-critical
     }
@@ -454,16 +451,14 @@ export class WorktreePoolService {
 
           if (fs.existsSync(mainGitDir)) {
             // Remove worktree via git
-            await execFileAsync('git', ['worktree', 'remove', '--force', reservePath], {
-              cwd: mainGitDir,
-            });
+            await this.execGit(['worktree', 'remove', '--force', reservePath], mainGitDir);
 
             // Try to remove the reserve branch
             const branchMatch = name.match(/^_reserve-(.+)$/);
             if (branchMatch) {
               const branchName = `_reserve/${branchMatch[1]}`;
               try {
-                await execFileAsync('git', ['branch', '-D', branchName], { cwd: mainGitDir });
+                await this.execGit(['branch', '-D', branchName], mainGitDir);
               } catch {
                 // Branch may not exist
               }

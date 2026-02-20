@@ -54,6 +54,8 @@ import {
   MAIN_PANEL_MIN_SIZE,
 } from './constants/layout';
 
+const DiffSmokeHarness = React.lazy(() => import('./components/e2e/DiffSmokeHarness'));
+
 const PINNED_TASKS_KEY = 'emdash-pinned-tasks';
 const PANEL_RESIZE_DRAGGING_EVENT = 'emdash:panel-resize-dragging';
 type ResizeHandleId = 'left' | 'right';
@@ -754,10 +756,19 @@ const AppContent: React.FC = () => {
 };
 
 const App: React.FC = () => {
+  const isDiffSmokeRoute =
+    typeof window !== 'undefined' && window.location.hash.startsWith('#/e2e/diff-smoke');
+
   return (
     <ThemeProvider>
       <ErrorBoundary>
-        <AppContent />
+        {isDiffSmokeRoute ? (
+          <React.Suspense fallback={null}>
+            <DiffSmokeHarness />
+          </React.Suspense>
+        ) : (
+          <AppContent />
+        )}
       </ErrorBoundary>
     </ThemeProvider>
   );

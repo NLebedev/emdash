@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getCachedGitStatus } from '@/lib/gitStatusCache';
 
 export interface TaskChange {
   path: string;
@@ -35,15 +34,6 @@ export function useTaskChanges(
     totalDeletions: 0,
     isLoading: true,
   });
-  const [isDocumentVisible, setIsDocumentVisible] = useState(() => {
-    if (typeof document === 'undefined') return true;
-    return document.visibilityState === 'visible';
-  });
-  const [isWindowFocused, setIsWindowFocused] = useState(() => {
-    if (typeof document === 'undefined') return true;
-    return document.hasFocus();
-  });
-
   const { isActive = true, idleIntervalMs = 60000 } = options;
   const taskPathRef = useRef(taskPath);
   const inFlightRef = useRef(false);
@@ -66,26 +56,6 @@ export function useTaskChanges(
     taskPathRef.current = taskPath;
     hasLoadedRef.current = false;
   }, [taskPath]);
-
-  useEffect(() => {
-    if (typeof document === 'undefined' || typeof window === 'undefined') return;
-
-    const handleVisibility = () => {
-      setIsDocumentVisible(document.visibilityState === 'visible');
-    };
-    const handleFocus = () => setIsWindowFocused(true);
-    const handleBlur = () => setIsWindowFocused(false);
-
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('focus', handleFocus);
-    window.addEventListener('blur', handleBlur);
-
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('focus', handleFocus);
-      window.removeEventListener('blur', handleBlur);
-    };
-  }, []);
 
   const queueRefresh = useCallback((shouldSetLoading: boolean) => {
     pendingRefreshRef.current = true;
@@ -116,7 +86,7 @@ export function useTaskChanges(
         }
 
         const requestPath = currentPath;
-        const result = await getCachedGitStatus(requestPath, { force: options?.force });
+        const result = await window.electronAPI.getGitStatus(requestPath);
 
         if (!mountedRef.current) return;
 
@@ -216,19 +186,29 @@ export function useTaskChanges(
     }
   }, [clearIdleHandle, fetchChanges, idleIntervalMs]);
 
-  const shouldPoll = Boolean(taskPath) && isActive && isDocumentVisible && isWindowFocused;
+  const shouldPoll = Boolean(taskPath) && isActive;
 
   useEffect(() => {
     shouldPollRef.current = shouldPoll;
   }, [shouldPoll]);
 
   useEffect(() => {
-    if (!taskPath || !shouldPoll) {
+    if (!taskPath) {
       clearIdleHandle();
       return;
     }
 
-    void fetchChanges(!hasLoadedRef.current);
+    // Always perform an initial fetch so sidebar badges render consistently,
+    // even if polling is currently paused due to focus/visibility state.
+    if (!hasLoadedRef.current) {
+      void fetchChanges(true);
+    }
+
+    if (!shouldPoll) {
+      clearIdleHandle();
+      return;
+    }
+
     scheduleIdleRefresh();
 
     return () => {

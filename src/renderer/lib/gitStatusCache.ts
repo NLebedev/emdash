@@ -5,6 +5,10 @@ export type GitStatusChange = {
   deletions: number;
   isStaged: boolean;
   hasUnstaged: boolean;
+  stagedAdditions: number;
+  stagedDeletions: number;
+  unstagedAdditions: number;
+  unstagedDeletions: number;
   diff?: string;
 };
 
