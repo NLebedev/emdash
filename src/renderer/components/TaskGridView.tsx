@@ -751,58 +751,58 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
         </div>
       </div>
 
-      {!isGridEnabled ? (
-        <div className="min-h-0 flex-1 overflow-hidden">{singleView}</div>
-      ) : null}
+      {!isGridEnabled ? <div className="min-h-0 flex-1 overflow-hidden">{singleView}</div> : null}
 
-      <div className={cn('min-h-0 flex-1 overflow-auto p-4', !isGridEnabled && 'hidden')}>
-        <div
-          className={cn(
-            'grid gap-4',
-            GRID_COLUMNS_CLASS[slotCount],
-            isTwoSlotExpanded && 'h-full auto-rows-fr'
-          )}
-        >
-          {Array.from({ length: displayCount }).map((_, index) => {
-            const item = orderedItems[index] || null;
+      {isGridEnabled ? (
+        <div className="min-h-0 flex-1 overflow-auto p-4">
+          <div
+            className={cn(
+              'grid gap-4',
+              GRID_COLUMNS_CLASS[slotCount],
+              isTwoSlotExpanded && 'h-full auto-rows-fr'
+            )}
+          >
+            {Array.from({ length: displayCount }).map((_, index) => {
+              const item = orderedItems[index] || null;
 
-            if (!item) {
+              if (!item) {
+                return (
+                  <EmptySlotCard
+                    key={`slot-empty-${index}`}
+                    slotIndex={index}
+                    tileHeightClass={tileHeightClass}
+                    isDropTarget={draggedItemKey !== null && dragOverIndex === index}
+                    onCreateTaskInSlot={handleCreateTaskInSlot}
+                    onDragOverSlot={handleDragOverSlot}
+                    onDropSlot={handleDropSlot}
+                  />
+                );
+              }
+
               return (
-                <EmptySlotCard
-                  key={`slot-empty-${index}`}
-                  slotIndex={index}
-                  tileHeightClass={tileHeightClass}
+                <TaskTerminalTile
+                  key={item.key}
+                  item={item}
+                  active={activeTask?.id === item.task.id && activeTask?.projectId === item.project.id}
                   isDropTarget={draggedItemKey !== null && dragOverIndex === index}
-                  onCreateTaskInSlot={handleCreateTaskInSlot}
+                  tileHeightClass={tileHeightClass}
+                  showProjectBadge={showProjectBadge}
+                  onSelectTaskInProject={onSelectTaskInProject}
+                  onOpenTaskInProject={onOpenTaskInProject}
+                  onDragHandleStart={setDraggedItemKey}
+                  onDragHandleEnd={() => {
+                    setDraggedItemKey(null);
+                    setDragOverIndex(null);
+                  }}
                   onDragOverSlot={handleDragOverSlot}
                   onDropSlot={handleDropSlot}
+                  slotIndex={index}
                 />
               );
-            }
-
-            return (
-              <TaskTerminalTile
-                key={item.key}
-                item={item}
-                active={activeTask?.id === item.task.id && activeTask?.projectId === item.project.id}
-                isDropTarget={draggedItemKey !== null && dragOverIndex === index}
-                tileHeightClass={tileHeightClass}
-                showProjectBadge={showProjectBadge}
-                onSelectTaskInProject={onSelectTaskInProject}
-                onOpenTaskInProject={onOpenTaskInProject}
-                onDragHandleStart={setDraggedItemKey}
-                onDragHandleEnd={() => {
-                  setDraggedItemKey(null);
-                  setDragOverIndex(null);
-                }}
-                onDragOverSlot={handleDragOverSlot}
-                onDropSlot={handleDropSlot}
-                slotIndex={index}
-              />
-            );
-          })}
+            })}
+          </div>
         </div>
-      </div>
+      ) : null}
 
       <Dialog open={projectPickerSlotIndex !== null} onOpenChange={(open) => !open && setProjectPickerSlotIndex(null)}>
         <DialogContent className="max-w-sm">

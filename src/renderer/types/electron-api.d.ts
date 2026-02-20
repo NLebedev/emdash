@@ -542,6 +542,10 @@ declare global {
           deletions: number;
           isStaged: boolean;
           hasUnstaged: boolean;
+          stagedAdditions: number;
+          stagedDeletions: number;
+          unstagedAdditions: number;
+          unstagedDeletions: number;
           diff?: string;
         }>;
         error?: string;
@@ -561,7 +565,11 @@ declare global {
       onGitStatusChanged: (
         listener: (data: { taskPath: string; error?: string }) => void
       ) => () => void;
-      getFileDiff: (args: { taskPath: string; filePath: string }) => Promise<{
+      getFileDiff: (args: {
+        taskPath: string;
+        filePath: string;
+        scope?: 'all' | 'staged' | 'unstaged';
+      }) => Promise<{
         success: boolean;
         diff?: {
           lines: Array<{
@@ -591,6 +599,17 @@ declare global {
         stagedHunks?: number;
         error?: string;
       }>;
+      unstageDiffRange: (args: {
+        taskPath: string;
+        filePath: string;
+        startLine: number;
+        endLine: number;
+      }) => Promise<{
+        success: boolean;
+        unstaged?: boolean;
+        unstagedHunks?: number;
+        error?: string;
+      }>;
       unstageFile: (args: { taskPath: string; filePath: string }) => Promise<{
         success: boolean;
         error?: string;
@@ -609,6 +628,13 @@ declare global {
         success: boolean;
         branch?: string;
         output?: string;
+        error?: string;
+      }>;
+      generateCommitMessage: (args: { taskPath: string }) => Promise<{
+        success: boolean;
+        message?: string;
+        providerId?: string;
+        source?: 'provider' | 'heuristic';
         error?: string;
       }>;
       generatePrContent: (args: { taskPath: string; base?: string }) => Promise<{
@@ -1504,6 +1530,13 @@ export interface ElectronAPI {
     success: boolean;
     url?: string;
     output?: string;
+    error?: string;
+  }>;
+  generateCommitMessage: (args: { taskPath: string }) => Promise<{
+    success: boolean;
+    message?: string;
+    providerId?: string;
+    source?: 'provider' | 'heuristic';
     error?: string;
   }>;
   mergeToMain: (args: { taskPath: string }) => Promise<{

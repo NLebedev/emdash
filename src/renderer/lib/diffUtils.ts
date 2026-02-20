@@ -195,3 +195,12 @@ export function isBinaryFile(filePath: string): boolean {
   ];
   return binaryExtensions.includes(ext);
 }
+
+/**
+ * Check if a file is an image we can preview inline.
+ */
+export function isImageFile(filePath: string): boolean {
+  const ext = filePath.split('.').pop()?.toLowerCase() || '';
+  const imageExtensions = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'webp', 'bmp'];
+  return imageExtensions.includes(ext);
+}

@@ -10,6 +10,7 @@ import {
   convertDiffLinesToMonacoFormat,
   getMonacoLanguageId,
   isBinaryFile,
+  isImageFile,
 } from '../lib/diffUtils';
 import { dispatchFileChangeEvent } from '../lib/fileChangeEvents';
 import { useToast } from '../hooks/use-toast';
@@ -40,6 +41,9 @@ interface FileDiffData {
   language: string;
   loading: boolean;
   error: string | null;
+  isImage?: boolean;
+  imageDataUrl?: string;
+  imageMimeType?: string;
   expanded: boolean;
   saving?: boolean;
   saveError?: string | null;
@@ -171,22 +175,99 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
       const totalLineChanges = file.additions + file.deletions;
       const isLargeByLineCount = totalLineChanges > LARGE_DIFF_LINE_THRESHOLD;
 
-      // Skip binary files
+      // Binary files: preview images, otherwise show placeholder error
       if (isBinaryFile(filePath)) {
-        setFileData((prev) => {
-          const next = new Map(prev);
-          next.set(filePath, {
-            original: '',
-            modified: '',
-            initialModified: '',
-            language: 'plaintext',
-            loading: false,
-            error: 'Binary file - diff not available',
-            expanded: true, // Default expanded
-            isLargeFile: false,
+        if (isImageFile(filePath)) {
+          setFileData((prev) => {
+            const next = new Map(prev);
+            next.set(filePath, {
+              original: '',
+              modified: '',
+              initialModified: '',
+              language: 'plaintext',
+              loading: true,
+              error: null,
+              isImage: true,
+              imageDataUrl: undefined,
+              imageMimeType: undefined,
+              expanded: true,
+              isLargeFile: false,
+            });
+            return next;
           });
-          return next;
-        });
+
+          if (file.status === 'deleted') {
+            setFileData((prev) => {
+              const next = new Map(prev);
+              next.set(filePath, {
+                original: '',
+                modified: '',
+                initialModified: '',
+                language: 'plaintext',
+                loading: false,
+                error: 'Deleted image - preview unavailable',
+                isImage: true,
+                expanded: true,
+                isLargeFile: false,
+              });
+              return next;
+            });
+            return;
+          }
+
+          try {
+            const imageRes = await window.electronAPI.fsReadImage(resolvedTaskPath, filePath);
+            setFileData((prev) => {
+              const next = new Map(prev);
+              next.set(filePath, {
+                original: '',
+                modified: '',
+                initialModified: '',
+                language: 'plaintext',
+                loading: false,
+                error: imageRes?.success && imageRes.dataUrl ? null : imageRes?.error || 'Failed to load image preview',
+                isImage: true,
+                imageDataUrl: imageRes?.success ? imageRes.dataUrl : undefined,
+                imageMimeType: imageRes?.success ? imageRes.mimeType : undefined,
+                expanded: true,
+                isLargeFile: false,
+              });
+              return next;
+            });
+          } catch (error: any) {
+            setFileData((prev) => {
+              const next = new Map(prev);
+              next.set(filePath, {
+                original: '',
+                modified: '',
+                initialModified: '',
+                language: 'plaintext',
+                loading: false,
+                error: error?.message || 'Failed to load image preview',
+                isImage: true,
+                expanded: true,
+                isLargeFile: false,
+              });
+              return next;
+            });
+          }
+        } else {
+          setFileData((prev) => {
+            const next = new Map(prev);
+            next.set(filePath, {
+              original: '',
+              modified: '',
+              initialModified: '',
+              language: 'plaintext',
+              loading: false,
+              error: 'Binary file - diff not available',
+              isImage: false,
+              expanded: true, // Default expanded
+              isLargeFile: false,
+            });
+            return next;
+          });
+        }
         return;
       }
 
@@ -200,6 +281,9 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
           language,
           loading: true,
           error: null,
+          isImage: false,
+          imageDataUrl: undefined,
+          imageMimeType: undefined,
           expanded: !isLargeByLineCount, // Collapse large files by default
           isLargeFile: isLargeByLineCount,
           largeFileReason: isLargeByLineCount ? 'line_count' : undefined,
@@ -299,6 +383,9 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
             language,
             loading: false,
             error: null,
+            isImage: false,
+            imageDataUrl: undefined,
+            imageMimeType: undefined,
             expanded: !isLargeFile, // Collapse large files by default
             isLargeFile,
             largeFileReason,
@@ -315,6 +402,9 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
             language,
             loading: false,
             error: error?.message || 'Failed to load file diff',
+            isImage: false,
+            imageDataUrl: undefined,
+            imageMimeType: undefined,
             expanded: !isLargeByLineCount, // Collapse large files even on error
             isLargeFile: isLargeByLineCount,
             largeFileReason: isLargeByLineCount ? 'line_count' : undefined,
@@ -909,6 +999,23 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                                   <span className="text-sm">
                                     {data?.error || 'Failed to load diff'}
                                   </span>
+                                </div>
+                              ) : data?.isImage ? (
+                                <div className="flex h-64 items-center justify-center overflow-auto bg-muted/20 p-4">
+                                  {data.imageDataUrl ? (
+                                    <img
+                                      src={data.imageDataUrl}
+                                      alt={file.path}
+                                      className="max-h-full max-w-full rounded-md border border-border bg-background object-contain shadow-sm"
+                                    />
+                                  ) : (
+                                    <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-muted-foreground">
+                                      <AlertCircle className="h-6 w-6 text-rose-500 dark:text-rose-400" />
+                                      <span className="text-sm">
+                                        {data.error || 'Image preview unavailable'}
+                                      </span>
+                                    </div>
+                                  )}
                                 </div>
                               ) : data?.isLargeFile ? (
                                 <div className="flex h-64 flex-col items-center justify-center gap-4 px-4 text-muted-foreground">

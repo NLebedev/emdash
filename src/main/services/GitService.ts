@@ -60,6 +60,10 @@ export type GitChange = {
   deletions: number;
   isStaged: boolean;
   hasUnstaged: boolean;
+  stagedAdditions: number;
+  stagedDeletions: number;
+  unstagedAdditions: number;
+  unstagedDeletions: number;
 };
 
 type ParsedDiffHunk = {
@@ -163,10 +167,14 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
     // First character is index (staged), second is working tree (unstaged)
     const isStaged = indexStatus !== ' ' && indexStatus !== '?';
     const hasUnstaged = worktreeStatus !== ' ';
-    let additions = 0;
-    let deletions = 0;
+    let stagedAdditions = 0;
+    let stagedDeletions = 0;
+    let unstagedAdditions = 0;
+    let unstagedDeletions = 0;
 
-    const sumNumstat = (stdout: string) => {
+    const parseNumstat = (stdout: string) => {
+      let additions = 0;
+      let deletions = 0;
       const lines = stdout
         .trim()
         .split('\n')
@@ -182,31 +190,55 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
           deletions += d;
         }
       }
+      return { additions, deletions };
     };
 
     try {
       const staged = await execFileAsync('git', ['diff', '--numstat', '--cached', '--', filePath], {
         cwd: taskPath,
       });
-      if (staged.stdout && staged.stdout.trim()) sumNumstat(staged.stdout);
+      if (staged.stdout && staged.stdout.trim()) {
+        const parsed = parseNumstat(staged.stdout);
+        stagedAdditions = parsed.additions;
+        stagedDeletions = parsed.deletions;
+      }
     } catch {}
 
     try {
       const unstaged = await execFileAsync('git', ['diff', '--numstat', '--', filePath], {
         cwd: taskPath,
       });
-      if (unstaged.stdout && unstaged.stdout.trim()) sumNumstat(unstaged.stdout);
+      if (unstaged.stdout && unstaged.stdout.trim()) {
+        const parsed = parseNumstat(unstaged.stdout);
+        unstagedAdditions = parsed.additions;
+        unstagedDeletions = parsed.deletions;
+      }
     } catch {}
+
+    let additions = stagedAdditions + unstagedAdditions;
+    const deletions = stagedDeletions + unstagedDeletions;
 
     if (additions === 0 && deletions === 0 && statusCode.includes('?')) {
       const absPath = path.join(taskPath, filePath);
       const count = await countFileNewlinesCapped(absPath, MAX_UNTRACKED_LINECOUNT_BYTES);
       if (typeof count === 'number') {
         additions = count;
+        unstagedAdditions = count;
       }
     }
 
-    changes.push({ path: filePath, status, additions, deletions, isStaged, hasUnstaged });
+    changes.push({
+      path: filePath,
+      status,
+      additions,
+      deletions,
+      isStaged,
+      hasUnstaged,
+      stagedAdditions,
+      stagedDeletions,
+      unstagedAdditions,
+      unstagedDeletions,
+    });
   }
 
   return changes;
@@ -220,28 +252,38 @@ export async function stageAllFiles(taskPath: string): Promise<void> {
   await execFileAsync('git', ['add', '-A'], { cwd: taskPath });
 }
 
-export async function stageDiffRange(
+type DiffRangeScope = 'staged' | 'unstaged';
+
+type ApplyDiffRangeResult = { applied: boolean; hunks: number };
+
+async function applyDiffRangeToIndex(
   taskPath: string,
   filePath: string,
   startLine: number,
-  endLine: number
-): Promise<{ staged: boolean; stagedHunks: number }> {
+  endLine: number,
+  scope: DiffRangeScope,
+  reverse: boolean
+): Promise<ApplyDiffRangeResult> {
   const normalizedStart = Math.max(1, Math.min(startLine, endLine));
   const normalizedEnd = Math.max(1, Math.max(startLine, endLine));
+  const diffArgs =
+    scope === 'staged'
+      ? ['diff', '--cached', '--no-color', '--no-ext-diff', '--unified=0', '--', filePath]
+      : ['diff', '--no-color', '--no-ext-diff', '--unified=0', '--', filePath];
 
   const { stdout: rawDiff } = await execFileAsync(
     'git',
-    ['diff', '--no-color', '--no-ext-diff', '--unified=0', '--', filePath],
+    diffArgs,
     { cwd: taskPath }
   );
 
   if (!rawDiff.trim()) {
-    return { staged: false, stagedHunks: 0 };
+    return { applied: false, hunks: 0 };
   }
 
   const { fileHeaders, hunks } = parseUnifiedDiff(rawDiff);
   if (hunks.length === 0) {
-    return { staged: false, stagedHunks: 0 };
+    return { applied: false, hunks: 0 };
   }
 
   const selectedHunks = hunks.filter((hunk) => {
@@ -251,7 +293,7 @@ export async function stageDiffRange(
   });
 
   if (selectedHunks.length === 0) {
-    return { staged: false, stagedHunks: 0 };
+    return { applied: false, hunks: 0 };
   }
 
   const patchLines = [...fileHeaders];
@@ -267,9 +309,14 @@ export async function stageDiffRange(
 
   try {
     await fs.promises.writeFile(tempPatchPath, patchContent, 'utf8');
+    const applyArgs = ['apply', '--cached', '--unidiff-zero', '--whitespace=nowarn'];
+    if (reverse) {
+      applyArgs.push('--reverse');
+    }
+    applyArgs.push(tempPatchPath);
     await execFileAsync(
       'git',
-      ['apply', '--cached', '--unidiff-zero', '--whitespace=nowarn', tempPatchPath],
+      applyArgs,
       { cwd: taskPath }
     );
   } finally {
@@ -280,7 +327,34 @@ export async function stageDiffRange(
     }
   }
 
-  return { staged: true, stagedHunks: selectedHunks.length };
+  return { applied: true, hunks: selectedHunks.length };
+}
+
+export async function stageDiffRange(
+  taskPath: string,
+  filePath: string,
+  startLine: number,
+  endLine: number
+): Promise<{ staged: boolean; stagedHunks: number }> {
+  const result = await applyDiffRangeToIndex(
+    taskPath,
+    filePath,
+    startLine,
+    endLine,
+    'unstaged',
+    false
+  );
+  return { staged: result.applied, stagedHunks: result.hunks };
+}
+
+export async function unstageDiffRange(
+  taskPath: string,
+  filePath: string,
+  startLine: number,
+  endLine: number
+): Promise<{ unstaged: boolean; unstagedHunks: number }> {
+  const result = await applyDiffRangeToIndex(taskPath, filePath, startLine, endLine, 'staged', true);
+  return { unstaged: result.applied, unstagedHunks: result.hunks };
 }
 
 export async function unstageFile(taskPath: string, filePath: string): Promise<void> {
@@ -336,99 +410,123 @@ export async function revertFile(
   return { action: 'reverted' };
 }
 
-export async function getFileDiff(
-  taskPath: string,
-  filePath: string
-): Promise<{ lines: Array<{ left?: string; right?: string; type: 'context' | 'add' | 'del' }> }> {
-  try {
-    const { stdout } = await execFileAsync(
-      'git',
-      ['diff', '--no-color', '--unified=2000', 'HEAD', '--', filePath],
-      { cwd: taskPath }
-    );
+export type GitDiffScope = 'all' | 'staged' | 'unstaged';
 
-    const linesRaw = stdout.split('\n');
-    const result: Array<{ left?: string; right?: string; type: 'context' | 'add' | 'del' }> = [];
-    for (const line of linesRaw) {
-      if (!line) continue;
-      if (
-        line.startsWith('diff ') ||
-        line.startsWith('index ') ||
-        line.startsWith('--- ') ||
-        line.startsWith('+++ ') ||
-        line.startsWith('@@')
-      )
-        continue;
-      const prefix = line[0];
-      const content = line.slice(1);
-      if (prefix === ' ') result.push({ left: content, right: content, type: 'context' });
-      else if (prefix === '-') result.push({ left: content, type: 'del' });
-      else if (prefix === '+') result.push({ right: content, type: 'add' });
-      else result.push({ left: line, right: line, type: 'context' });
+type GitDiffLine = { left?: string; right?: string; type: 'context' | 'add' | 'del' };
+
+function parseDiffOutput(stdout: string): GitDiffLine[] {
+  const linesRaw = stdout.split('\n');
+  const result: GitDiffLine[] = [];
+
+  for (const line of linesRaw) {
+    if (!line) continue;
+    if (
+      line.startsWith('diff ') ||
+      line.startsWith('index ') ||
+      line.startsWith('--- ') ||
+      line.startsWith('+++ ') ||
+      line.startsWith('@@')
+    ) {
+      continue;
     }
 
-    if (result.length === 0) {
+    const prefix = line[0];
+    const content = line.slice(1);
+    if (prefix === ' ') result.push({ left: content, right: content, type: 'context' });
+    else if (prefix === '-') result.push({ left: content, type: 'del' });
+    else if (prefix === '+') result.push({ right: content, type: 'add' });
+    else result.push({ left: line, right: line, type: 'context' });
+  }
+
+  return result;
+}
+
+function toAddedLines(content: string): GitDiffLine[] {
+  return content.split('\n').map((line) => ({ right: line, type: 'add' as const }));
+}
+
+function toDeletedLines(content: string): GitDiffLine[] {
+  return content.split('\n').map((line) => ({ left: line, type: 'del' as const }));
+}
+
+function getDiffArgs(filePath: string, scope: GitDiffScope): string[] {
+  if (scope === 'staged') {
+    return ['diff', '--cached', '--no-color', '--unified=2000', '--', filePath];
+  }
+  if (scope === 'unstaged') {
+    return ['diff', '--no-color', '--unified=2000', '--', filePath];
+  }
+  return ['diff', '--no-color', '--unified=2000', 'HEAD', '--', filePath];
+}
+
+export async function getFileDiff(
+  taskPath: string,
+  filePath: string,
+  scope: GitDiffScope = 'all'
+): Promise<{ lines: GitDiffLine[] }> {
+  try {
+    const { stdout } = await execFileAsync('git', getDiffArgs(filePath, scope), {
+      cwd: taskPath,
+    });
+    const parsed = parseDiffOutput(stdout);
+    if (parsed.length > 0) {
+      return { lines: parsed };
+    }
+  } catch {
+    // Fall through to scope-specific recovery paths.
+  }
+
+  if (scope !== 'staged') {
+    const absPath = path.join(taskPath, filePath);
+    const currentContent = await readFileTextCapped(absPath, MAX_UNTRACKED_DIFF_BYTES);
+    if (currentContent !== null) {
+      return { lines: toAddedLines(currentContent) };
+    }
+  }
+
+  if (scope === 'unstaged') {
+    try {
+      const { stdout: indexContent } = await execFileAsync('git', ['show', `:${filePath}`], {
+        cwd: taskPath,
+      });
+      return { lines: toDeletedLines(indexContent) };
+    } catch {
+      return { lines: [] };
+    }
+  }
+
+  if (scope === 'staged') {
+    try {
+      const { stdout: indexContent } = await execFileAsync('git', ['show', `:${filePath}`], {
+        cwd: taskPath,
+      });
       try {
-        const abs = path.join(taskPath, filePath);
-        const content = await readFileTextCapped(abs, MAX_UNTRACKED_DIFF_BYTES);
-        if (content !== null) {
-          return { lines: content.split('\n').map((l) => ({ right: l, type: 'add' as const })) };
-        }
-        const { stdout: prev } = await execFileAsync('git', ['show', `HEAD:${filePath}`], {
+        await execFileAsync('git', ['cat-file', '-e', `HEAD:${filePath}`], { cwd: taskPath });
+        // File exists in HEAD and no parsed diff means there are no staged changes for this file.
+        return { lines: [] };
+      } catch {
+        // File exists in index but not in HEAD -> staged add.
+        return { lines: toAddedLines(indexContent) };
+      }
+    } catch {
+      try {
+        // File missing from index but present in HEAD -> staged delete.
+        const { stdout: headContent } = await execFileAsync('git', ['show', `HEAD:${filePath}`], {
           cwd: taskPath,
         });
-        return { lines: prev.split('\n').map((l) => ({ left: l, type: 'del' as const })) };
+        return { lines: toDeletedLines(headContent) };
       } catch {
         return { lines: [] };
       }
     }
+  }
 
-    return { lines: result };
+  try {
+    const { stdout: headContent } = await execFileAsync('git', ['show', `HEAD:${filePath}`], {
+      cwd: taskPath,
+    });
+    return { lines: toDeletedLines(headContent) };
   } catch {
-    const abs = path.join(taskPath, filePath);
-    const content = await readFileTextCapped(abs, MAX_UNTRACKED_DIFF_BYTES);
-    if (content !== null) {
-      const lines = content.split('\n');
-      return { lines: lines.map((l) => ({ right: l, type: 'add' as const })) };
-    }
-    try {
-      const { stdout } = await execFileAsync(
-        'git',
-        ['diff', '--no-color', '--unified=2000', 'HEAD', '--', filePath],
-        { cwd: taskPath }
-      );
-      const linesRaw = stdout.split('\n');
-      const result: Array<{ left?: string; right?: string; type: 'context' | 'add' | 'del' }> = [];
-      for (const line of linesRaw) {
-        if (!line) continue;
-        if (
-          line.startsWith('diff ') ||
-          line.startsWith('index ') ||
-          line.startsWith('--- ') ||
-          line.startsWith('+++ ') ||
-          line.startsWith('@@')
-        )
-          continue;
-        const prefix = line[0];
-        const content = line.slice(1);
-        if (prefix === ' ') result.push({ left: content, right: content, type: 'context' });
-        else if (prefix === '-') result.push({ left: content, type: 'del' });
-        else if (prefix === '+') result.push({ right: content, type: 'add' });
-        else result.push({ left: line, right: line, type: 'context' });
-      }
-      if (result.length === 0) {
-        try {
-          const { stdout: prev } = await execFileAsync('git', ['show', `HEAD:${filePath}`], {
-            cwd: taskPath,
-          });
-          return { lines: prev.split('\n').map((l) => ({ left: l, type: 'del' as const })) };
-        } catch {
-          return { lines: [] };
-        }
-      }
-      return { lines: result };
-    } catch {
-      return { lines: [] };
-    }
+    return { lines: [] };
   }
 }

@@ -13,7 +13,7 @@ import { usePrStatus } from '../hooks/usePrStatus';
 import { useCheckRuns } from '../hooks/useCheckRuns';
 import { useAutoCheckRunsRefresh } from '../hooks/useAutoCheckRunsRefresh';
 import { usePrComments } from '../hooks/usePrComments';
-import { splitChangesByStage } from '../lib/diffStaging';
+import { getChangeCountsForSection, splitChangesByStage } from '../lib/diffStaging';
 import { ChecksPanel } from './CheckRunsList';
 import { PrCommentsList } from './PrCommentsList';
 import { FileIcon } from './FileExplorer/FileIcons';
@@ -31,6 +31,7 @@ import {
   CheckCircle2,
   XCircle,
   GitMerge,
+  WandSparkles,
 } from 'lucide-react';
 import {
   AlertDialog,
@@ -145,11 +146,13 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
 
   const [showDiffModal, setShowDiffModal] = useState(false);
   const [showAllChangesModal, setShowAllChangesModal] = useState(false);
-  const [selectedPath, setSelectedPath] = useState<string | undefined>(undefined);
+  const [selectedDiffFile, setSelectedDiffFile] = useState<
+    { path: string; section: 'staged' | 'unstaged' } | undefined
+  >(undefined);
 
-  // Reset selectedPath when task changes
+  // Reset selected diff target when task changes
   useEffect(() => {
-    setSelectedPath(undefined);
+    setSelectedDiffFile(undefined);
   }, [resolvedTaskPath]);
   const [stagingFiles, setStagingFiles] = useState<Set<string>>(new Set());
   const [unstagingFiles, setUnstagingFiles] = useState<Set<string>>(new Set());
@@ -157,6 +160,8 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
   const [isStagingAll, setIsStagingAll] = useState(false);
   const [commitMessage, setCommitMessage] = useState('');
   const [isCommitting, setIsCommitting] = useState(false);
+  const [isGeneratingCommitMessage, setIsGeneratingCommitMessage] = useState(false);
+  const [isAiCommitPrRunning, setIsAiCommitPrRunning] = useState(false);
   const [isMergingToMain, setIsMergingToMain] = useState(false);
   const [showMergeConfirm, setShowMergeConfirm] = useState(false);
   const [prMode, setPrMode] = useState<PrMode>(() => {
@@ -467,6 +472,107 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
     }
   };
 
+  const handlePostPrSuccess = async () => {
+    await refreshChanges();
+    try {
+      await refreshPr();
+    } catch {
+      // PR refresh is best-effort
+    }
+  };
+
+  const requestGeneratedCommitMessage = async (
+    options: { showSuccessToast?: boolean } = {}
+  ): Promise<string | null> => {
+    if (!hasStagedChanges) {
+      toast({
+        title: 'No Staged Changes',
+        description: 'Please stage some files before generating a commit message.',
+        variant: 'destructive',
+      });
+      return null;
+    }
+
+    const api = window.electronAPI;
+    if (!api?.generateCommitMessage) {
+      toast({
+        title: 'Unavailable',
+        description: 'Commit message generation is not available in this build.',
+        variant: 'destructive',
+      });
+      return null;
+    }
+
+    setIsGeneratingCommitMessage(true);
+    try {
+      const result = await api.generateCommitMessage({ taskPath: safeTaskPath });
+      const message = result?.message?.trim();
+
+      if (!result?.success || !message) {
+        throw new Error(result?.error || 'Failed to generate commit message from staged changes.');
+      }
+
+      setCommitMessage(message);
+
+      if (options.showSuccessToast !== false) {
+        const sourceDetail = result.providerId
+          ? `Generated with ${result.providerId}.`
+          : result.source === 'heuristic'
+            ? 'Generated heuristically.'
+            : undefined;
+
+        toast({
+          title: 'Commit Message Generated',
+          description: sourceDetail,
+        });
+      }
+
+      return message;
+    } catch (error) {
+      const description = error instanceof Error ? error.message : 'Failed to generate commit message.';
+      toast({
+        title: 'Generation Failed',
+        description,
+        variant: 'destructive',
+      });
+      return null;
+    } finally {
+      setIsGeneratingCommitMessage(false);
+    }
+  };
+
+  const handleGenerateCommitMessage = async () => {
+    await requestGeneratedCommitMessage({ showSuccessToast: true });
+  };
+
+  const handleAiCommitPushAndPr = async () => {
+    if (!hasStagedChanges) {
+      toast({
+        title: 'No Staged Changes',
+        description: 'Please stage some files before running AI commit + PR.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    setIsAiCommitPrRunning(true);
+    try {
+      const generatedMessage = await requestGeneratedCommitMessage({ showSuccessToast: false });
+      if (!generatedMessage) {
+        return;
+      }
+
+      await createPR({
+        taskPath: safeTaskPath,
+        commitMessage: generatedMessage,
+        prOptions: prMode === 'draft' ? { draft: true } : undefined,
+        onSuccess: handlePostPrSuccess,
+      });
+    } finally {
+      setIsAiCommitPrRunning(false);
+    }
+  };
+
   const handleMergeToMain = async () => {
     setIsMergingToMain(true);
     try {
@@ -512,14 +618,7 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
       await createPR({
         taskPath: safeTaskPath,
         prOptions: prMode === 'draft' ? { draft: true } : undefined,
-        onSuccess: async () => {
-          await refreshChanges();
-          try {
-            await refreshPr();
-          } catch {
-            // PR refresh is best-effort
-          }
-        },
+        onSuccess: handlePostPrSuccess,
       });
     }
   };
@@ -550,42 +649,104 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
     change: (typeof fileChanges)[number],
     section: 'staged' | 'unstaged',
     rowKey: string
-  ) => (
-    <div
-      key={rowKey}
-      className={`flex cursor-pointer items-center justify-between border-b border-border/50 px-4 py-2.5 last:border-b-0 hover:bg-muted/50 ${
-        section === 'staged' ? 'bg-muted/50' : ''
-      }`}
-      onClick={() => {
-        void (async () => {
-          const { captureTelemetry } = await import('../lib/telemetryClient');
-          captureTelemetry('changes_viewed');
-        })();
-        setSelectedPath(change.path);
-        setShowDiffModal(true);
-      }}
-    >
-      <div className="flex min-w-0 flex-1 items-center gap-3">
-        <span className="inline-flex items-center justify-center text-muted-foreground">
-          <FileIcon filename={change.path} isDirectory={false} size={16} />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm">{renderPath(change.path)}</div>
+  ) => {
+    const sectionCounts = getChangeCountsForSection(change, section);
+
+    return (
+      <div
+        key={rowKey}
+        className={`flex cursor-pointer items-center justify-between border-b border-border/50 px-4 py-2.5 last:border-b-0 hover:bg-muted/50 ${
+          section === 'staged' ? 'bg-muted/50' : ''
+        }`}
+        onClick={() => {
+          void (async () => {
+            const { captureTelemetry } = await import('../lib/telemetryClient');
+            captureTelemetry('changes_viewed');
+          })();
+          setSelectedDiffFile({ path: change.path, section });
+          setShowDiffModal(true);
+        }}
+      >
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <span className="inline-flex items-center justify-center text-muted-foreground">
+            <FileIcon filename={change.path} isDirectory={false} size={16} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm">{renderPath(change.path)}</div>
+          </div>
         </div>
-      </div>
-      <div className="ml-3 flex items-center gap-2">
-        {change.additions > 0 && (
-          <span className="rounded bg-green-50 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-green-900/30 dark:text-emerald-300">
-            +{change.additions}
-          </span>
-        )}
-        {change.deletions > 0 && (
-          <span className="rounded bg-rose-50 px-1.5 py-0.5 text-[11px] font-medium text-rose-700 dark:bg-rose-900/30 dark:text-rose-300">
-            -{change.deletions}
-          </span>
-        )}
-        <div className="flex items-center gap-1">
-          {section === 'unstaged' && (
+        <div className="ml-3 flex items-center gap-2">
+          {sectionCounts.additions > 0 && (
+            <span className="rounded bg-green-50 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-green-900/30 dark:text-emerald-300">
+              +{sectionCounts.additions}
+            </span>
+          )}
+          {sectionCounts.deletions > 0 && (
+            <span className="rounded bg-rose-50 px-1.5 py-0.5 text-[11px] font-medium text-rose-700 dark:bg-rose-900/30 dark:text-rose-300">
+              -{sectionCounts.deletions}
+            </span>
+          )}
+          <div className="flex items-center gap-1">
+            {section === 'unstaged' && (
+              <TooltipProvider delayDuration={100}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 text-muted-foreground hover:bg-accent hover:text-foreground"
+                      onClick={(e) => handleStageFile(change.path, e)}
+                      disabled={stagingFiles.has(change.path)}
+                    >
+                      {stagingFiles.has(change.path) ? (
+                        <Spinner size="sm" />
+                      ) : (
+                        <Plus className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent
+                    side="left"
+                    className="max-w-xs border border-border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-lg"
+                  >
+                    <p className="font-medium">Stage file for commit</p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Add this file to the staging area so it will be included in the next commit
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
+            {section === 'staged' && (
+              <TooltipProvider delayDuration={100}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 text-muted-foreground hover:bg-accent hover:text-foreground"
+                      onClick={(e) => handleUnstageFile(change.path, e)}
+                      disabled={unstagingFiles.has(change.path)}
+                    >
+                      {unstagingFiles.has(change.path) ? (
+                        <Spinner size="sm" />
+                      ) : (
+                        <Minus className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent
+                    side="left"
+                    className="max-w-xs border border-border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-lg"
+                  >
+                    <p className="font-medium">Unstage file</p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Remove this file from staging so it will not be included in the next commit
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
             <TooltipProvider delayDuration={100}>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -593,89 +754,35 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
                     variant="ghost"
                     size="icon"
                     className="h-8 w-8 text-muted-foreground hover:bg-accent hover:text-foreground"
-                    onClick={(e) => handleStageFile(change.path, e)}
-                    disabled={stagingFiles.has(change.path)}
+                    onClick={(e) => handleRevertFile(change.path, e)}
+                    disabled={revertingFiles.has(change.path)}
                   >
-                    {stagingFiles.has(change.path) ? <Spinner size="sm" /> : <Plus className="h-4 w-4" />}
+                    {revertingFiles.has(change.path) ? <Spinner size="sm" /> : <Undo2 className="h-4 w-4" />}
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent
                   side="left"
                   className="max-w-xs border border-border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-lg"
                 >
-                  <p className="font-medium">Stage file for commit</p>
+                  <p className="font-medium">Revert file changes</p>
                   <p className="mt-0.5 text-xs text-muted-foreground">
-                    Add this file to the staging area so it will be included in the next commit
+                    Discard all uncommitted changes to this file and restore it to the last committed
+                    version
                   </p>
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
-          )}
-          {section === 'staged' && (
-            <TooltipProvider delayDuration={100}>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 text-muted-foreground hover:bg-accent hover:text-foreground"
-                    onClick={(e) => handleUnstageFile(change.path, e)}
-                    disabled={unstagingFiles.has(change.path)}
-                  >
-                    {unstagingFiles.has(change.path) ? (
-                      <Spinner size="sm" />
-                    ) : (
-                      <Minus className="h-4 w-4" />
-                    )}
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent
-                  side="left"
-                  className="max-w-xs border border-border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-lg"
-                >
-                  <p className="font-medium">Unstage file</p>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    Remove this file from staging so it will not be included in the next commit
-                  </p>
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          )}
-          <TooltipProvider delayDuration={100}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8 text-muted-foreground hover:bg-accent hover:text-foreground"
-                  onClick={(e) => handleRevertFile(change.path, e)}
-                  disabled={revertingFiles.has(change.path)}
-                >
-                  {revertingFiles.has(change.path) ? <Spinner size="sm" /> : <Undo2 className="h-4 w-4" />}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent
-                side="left"
-                className="max-w-xs border border-border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-lg"
-              >
-                <p className="font-medium">Revert file changes</p>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  Discard all uncommitted changes to this file and restore it to the last committed
-                  version
-                </p>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+          </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   if (!canRender) {
     return null;
   }
 
-  const isActionLoading = isCreatingPR || isMergingToMain;
+  const isActionLoading = isCreatingPR || isMergingToMain || isAiCommitPrRunning;
 
   return (
     <div className={`flex h-full flex-col bg-card shadow-sm ${className}`}>
@@ -745,6 +852,7 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
                   value={commitMessage}
                   onChange={(e) => setCommitMessage(e.target.value)}
                   className="h-8 flex-1 text-sm"
+                  disabled={isGeneratingCommitMessage || isAiCommitPrRunning || isCommitting}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
@@ -752,13 +860,56 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
                     }
                   }}
                 />
+                <TooltipProvider delayDuration={100}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        className="h-8 w-8"
+                        title="Generate commit message from staged changes"
+                        onClick={handleGenerateCommitMessage}
+                        disabled={isGeneratingCommitMessage || isAiCommitPrRunning || isCommitting}
+                      >
+                        {isGeneratingCommitMessage ? (
+                          <Spinner size="sm" />
+                        ) : (
+                          <WandSparkles className="h-3.5 w-3.5" />
+                        )}
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent
+                      side="top"
+                      className="max-w-xs border border-border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-lg"
+                    >
+                      <p className="font-medium">Generate commit message</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        Use the task&apos;s model to draft a message from staged changes
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 px-2 text-xs"
+                  title="Generate message, commit staged changes, push, and open PR"
+                  onClick={handleAiCommitPushAndPr}
+                  disabled={
+                    isAiCommitPrRunning || isGeneratingCommitMessage || isCommitting || isActionLoading
+                  }
+                >
+                  {isAiCommitPrRunning ? <Spinner size="sm" /> : 'AI Commit + PR'}
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
                   className="h-8 px-2 text-xs"
                   title="Commit all staged changes and push the branch"
                   onClick={handleCommitAndPush}
-                  disabled={isCommitting || !commitMessage.trim()}
+                  disabled={
+                    isCommitting || isGeneratingCommitMessage || isAiCommitPrRunning || !commitMessage.trim()
+                  }
                 >
                   {isCommitting ? <Spinner size="sm" /> : 'Commit & Push'}
                 </Button>
@@ -903,7 +1054,8 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
           taskId={resolvedTaskId}
           taskPath={resolvedTaskPath}
           files={fileChanges}
-          initialFile={selectedPath}
+          initialFile={selectedDiffFile?.path}
+          initialSection={selectedDiffFile?.section}
           onRefreshChanges={refreshChanges}
           onToggleView={() => {
             setShowDiffModal(false);
@@ -920,7 +1072,12 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
           onRefreshChanges={refreshChanges}
           onOpenFile={(filePath) => {
             setShowAllChangesModal(false);
-            setSelectedPath(filePath);
+            const selectedFile = fileChanges.find((file) => file.path === filePath);
+            const section =
+              selectedFile && (selectedFile.hasUnstaged || !selectedFile.isStaged)
+                ? 'unstaged'
+                : 'staged';
+            setSelectedDiffFile({ path: filePath, section });
             setShowDiffModal(true);
           }}
           onToggleView={() => {
@@ -928,9 +1085,12 @@ const FileChangesPanelComponent: React.FC<FileChangesPanelProps> = ({
             // If we have a selected path that exists in current changes, use it
             // Otherwise default to the first file
             const isValidSelection =
-              selectedPath && fileChanges.some((f) => f.path === selectedPath);
+              selectedDiffFile?.path && fileChanges.some((f) => f.path === selectedDiffFile.path);
             if (!isValidSelection && fileChanges.length > 0) {
-              setSelectedPath(fileChanges[0].path);
+              const firstFile = fileChanges[0];
+              const section =
+                firstFile.hasUnstaged || !firstFile.isStaged ? 'unstaged' : 'staged';
+              setSelectedDiffFile({ path: firstFile.path, section });
             }
             setShowDiffModal(true);
           }}

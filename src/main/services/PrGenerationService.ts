@@ -11,6 +11,12 @@ export interface GeneratedPrContent {
   description: string;
 }
 
+export interface GeneratedCommitMessage {
+  message: string;
+  providerId?: string;
+  source: 'provider' | 'heuristic';
+}
+
 /**
  * Generates PR title and description using available CLI agents or fallback heuristics
  */
@@ -91,6 +97,65 @@ export class PrGenerationService {
       log.error('Failed to generate PR content', { error });
       return this.generateFallbackContent([]);
     }
+  }
+
+  /**
+   * Generate a single commit message based only on staged changes.
+   */
+  async generateCommitMessage(
+    taskPath: string,
+    preferredProviderId?: string | null
+  ): Promise<GeneratedCommitMessage> {
+    const { stagedDiffStat, stagedDiffPatch, stagedFiles } = await this.getStagedGitContext(taskPath);
+
+    if (!stagedDiffStat && !stagedDiffPatch && stagedFiles.length === 0) {
+      return {
+        message: 'chore: apply staged changes',
+        source: 'heuristic',
+      };
+    }
+
+    const prompt = this.buildCommitMessagePrompt(stagedDiffStat, stagedDiffPatch, stagedFiles);
+    const triedProviders = new Set<ProviderId>();
+
+    const tryProvider = async (providerId: ProviderId): Promise<GeneratedCommitMessage | null> => {
+      if (triedProviders.has(providerId)) {
+        return null;
+      }
+      triedProviders.add(providerId);
+
+      try {
+        const response = await this.invokeProviderForPrompt(providerId, taskPath, prompt);
+        if (!response) return null;
+        const parsed = this.parseCommitMessageResponse(response);
+        if (!parsed) return null;
+
+        return {
+          message: parsed,
+          providerId,
+          source: 'provider',
+        };
+      } catch (error) {
+        log.debug(`Commit message generation failed for provider ${providerId}`, { error });
+        return null;
+      }
+    };
+
+    if (preferredProviderId && this.isValidProviderId(preferredProviderId)) {
+      const preferred = await tryProvider(preferredProviderId as ProviderId);
+      if (preferred) return preferred;
+    }
+
+    const claudeResult = await tryProvider('claude');
+    if (claudeResult) return claudeResult;
+
+    const codexResult = await tryProvider('codex');
+    if (codexResult) return codexResult;
+
+    return {
+      message: this.generateHeuristicCommitMessage(stagedFiles, stagedDiffStat),
+      source: 'heuristic',
+    };
   }
 
   /**
@@ -244,6 +309,27 @@ export class PrGenerationService {
     diff: string,
     commits: string[]
   ): Promise<GeneratedPrContent | null> {
+    const prompt = this.buildPrGenerationPrompt(diff, commits);
+    const response = await this.invokeProviderForPrompt(providerId, taskPath, prompt);
+    if (!response) {
+      return null;
+    }
+
+    const result = this.parseProviderResponse(response);
+    if (result) {
+      log.info(`Successfully generated PR content with ${providerId}`);
+      return result;
+    }
+
+    log.debug(`Failed to parse response from ${providerId}`, { response });
+    return null;
+  }
+
+  private async invokeProviderForPrompt(
+    providerId: ProviderId,
+    taskPath: string,
+    prompt: string
+  ): Promise<string | null> {
     const provider = getProvider(providerId);
     if (!provider || !provider.cli) {
       return null;
@@ -254,7 +340,6 @@ export class PrGenerationService {
       return null;
     }
 
-    // Check if provider CLI is available
     try {
       await execFileAsync(cliCommand, provider.versionArgs || ['--version'], {
         cwd: taskPath,
@@ -264,17 +349,11 @@ export class PrGenerationService {
       return null;
     }
 
-    // Build prompt for PR generation
-    const prompt = this.buildPrGenerationPrompt(diff, commits);
-
-    // Use spawn with stdin/stdout to invoke the CLI agent non-interactively
-    // This uses the user's authenticated CLI agent (no API keys needed)
-    return new Promise<GeneratedPrContent | null>((resolve) => {
-      const timeout = 30000; // 30 second timeout
+    return new Promise<string | null>((resolve) => {
+      const timeout = 30000;
       let stdout = '';
       let stderr = '';
 
-      // Build command arguments
       const args: string[] = [];
       if (provider.defaultArgs?.length) {
         args.push(...provider.defaultArgs);
@@ -283,28 +362,23 @@ export class PrGenerationService {
         args.push(provider.autoApproveFlag);
       }
 
-      // Handle prompt: some providers accept it as a flag, others via stdin
       let promptViaStdin = true;
       if (provider.initialPromptFlag !== undefined && provider.initialPromptFlag !== '') {
-        // Provider accepts prompt as command-line argument
         args.push(provider.initialPromptFlag);
         args.push(prompt);
         promptViaStdin = false;
       }
 
-      // Spawn the provider CLI
       const child = spawn(cliCommand, args, {
         cwd: taskPath,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: {
           ...process.env,
-          // Ensure we have a proper terminal environment
           TERM: 'xterm-256color',
           COLORTERM: 'truecolor',
         },
       });
 
-      // Set timeout
       const timeoutId = setTimeout(() => {
         try {
           child.kill('SIGTERM');
@@ -313,21 +387,18 @@ export class PrGenerationService {
         resolve(null);
       }, timeout);
 
-      // Collect stdout
       if (child.stdout) {
         child.stdout.on('data', (data: Buffer) => {
           stdout += data.toString('utf8');
         });
       }
 
-      // Collect stderr (for debugging)
       if (child.stderr) {
         child.stderr.on('data', (data: Buffer) => {
           stderr += data.toString('utf8');
         });
       }
 
-      // Handle process exit
       child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
         clearTimeout(timeoutId);
 
@@ -343,34 +414,20 @@ export class PrGenerationService {
           return;
         }
 
-        // Try to parse the response
-        const result = this.parseProviderResponse(stdout);
-        if (result) {
-          log.info(`Successfully generated PR content with ${providerId}`);
-          resolve(result);
-        } else {
-          log.debug(`Failed to parse response from ${providerId}`, { stdout, stderr });
-          resolve(null);
-        }
+        resolve(stdout);
       });
 
-      // Handle errors
       child.on('error', (error: Error) => {
         clearTimeout(timeoutId);
         log.debug(`Failed to spawn ${providerId}`, { error });
         resolve(null);
       });
 
-      // Send prompt via stdin if needed
-      // Claude Code and Codex accept prompts via stdin (initialPromptFlag is empty string)
       if (promptViaStdin) {
         try {
           if (child.stdin) {
-            // Write the prompt
             child.stdin.write(prompt);
-            // Add a newline to ensure the prompt is processed
             child.stdin.write('\n');
-            // Close stdin to signal EOF - this should make the CLI process the prompt and exit
             child.stdin.end();
           }
         } catch (error) {
@@ -381,11 +438,8 @@ export class PrGenerationService {
           log.debug(`Failed to write prompt to ${providerId}`, { error });
           resolve(null);
         }
-      } else {
-        // Prompt was passed as command-line argument, just close stdin
-        if (child.stdin) {
-          child.stdin.end();
-        }
+      } else if (child.stdin) {
+        child.stdin.end();
       }
     });
   }
@@ -411,6 +465,81 @@ Please respond in the following JSON format:
 }
 
 Only respond with valid JSON, no other text.`;
+  }
+
+  private async getStagedGitContext(taskPath: string): Promise<{
+    stagedDiffStat: string;
+    stagedDiffPatch: string;
+    stagedFiles: string[];
+  }> {
+    let stagedDiffStat = '';
+    let stagedDiffPatch = '';
+    let stagedFiles: string[] = [];
+
+    try {
+      const { stdout: statOut } = await execAsync('git diff --cached --stat', {
+        cwd: taskPath,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      stagedDiffStat = (statOut || '').trim();
+    } catch {}
+
+    try {
+      const { stdout: filesOut } = await execAsync('git diff --cached --name-only', {
+        cwd: taskPath,
+        maxBuffer: 2 * 1024 * 1024,
+      });
+      stagedFiles = (filesOut || '')
+        .split('\n')
+        .map((file) => file.trim())
+        .filter(Boolean);
+    } catch {}
+
+    try {
+      const { stdout: patchOut } = await execAsync('git diff --cached --no-color --no-ext-diff', {
+        cwd: taskPath,
+        maxBuffer: 20 * 1024 * 1024,
+      });
+      stagedDiffPatch = (patchOut || '').trim();
+    } catch {}
+
+    return {
+      stagedDiffStat,
+      stagedDiffPatch,
+      stagedFiles,
+    };
+  }
+
+  private buildCommitMessagePrompt(
+    stagedDiffStat: string,
+    stagedDiffPatch: string,
+    stagedFiles: string[]
+  ): string {
+    const filesContext =
+      stagedFiles.length > 0
+        ? `\n\nStaged files:\n${stagedFiles.slice(0, 80).map((file) => `- ${file}`).join('\n')}`
+        : '';
+    const statsContext = stagedDiffStat ? `\n\nStaged diff stats:\n${stagedDiffStat}` : '';
+    const patchLimit = 5000;
+    const patchContext = stagedDiffPatch
+      ? `\n\nStaged patch:\n${stagedDiffPatch.slice(0, patchLimit)}${stagedDiffPatch.length > patchLimit ? '\n...' : ''}`
+      : '';
+
+    return `Generate exactly one git commit message for these STAGED changes.
+
+Requirements:
+- Return a single concise commit message line.
+- Use conventional commit style when appropriate (feat:, fix:, refactor:, docs:, test:, chore:, etc.).
+- Keep it under 72 characters.
+- Focus on what changed, not why the model generated it.
+- Do not include markdown, code fences, bullet points, or explanation.
+
+${filesContext}${statsContext}${patchContext}
+
+Respond in JSON only:
+{
+  "message": "your commit message"
+}`;
   }
 
   /**
@@ -454,6 +583,104 @@ Only respond with valid JSON, no other text.`;
       log.debug('Failed to parse provider response', { error, response });
     }
     return null;
+  }
+
+  private parseCommitMessageResponse(response: string): string | null {
+    try {
+      const jsonMatch = response.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (typeof parsed?.message === 'string') {
+          return this.normalizeCommitMessage(parsed.message);
+        }
+      }
+    } catch (error) {
+      log.debug('Failed to parse commit message JSON response', { error, response });
+    }
+
+    const candidate = response
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .find((line) => !line.startsWith('```') && !line.startsWith('{') && !line.startsWith('}'));
+
+    if (!candidate) {
+      return null;
+    }
+
+    return this.normalizeCommitMessage(candidate);
+  }
+
+  private normalizeCommitMessage(message: string): string | null {
+    let normalized = message.trim();
+    normalized = normalized.replace(/^["'`]+|["'`]+$/g, '');
+    normalized = normalized.replace(/^commit message:\s*/i, '');
+    normalized = normalized.replace(/\s+/g, ' ').trim();
+
+    if (!normalized) {
+      return null;
+    }
+
+    if (normalized.length > 72) {
+      normalized = `${normalized.slice(0, 69).trimEnd()}...`;
+    }
+
+    return normalized || null;
+  }
+
+  private generateHeuristicCommitMessage(stagedFiles: string[], stagedDiffStat: string): string {
+    if (stagedFiles.length === 0) {
+      return 'chore: apply staged changes';
+    }
+
+    const lowerFiles = stagedFiles.map((file) => file.toLowerCase());
+    const onlyDocs = lowerFiles.every(
+      (file) =>
+        file.includes('/docs/') ||
+        file.endsWith('.md') ||
+        file.endsWith('.mdx') ||
+        file.endsWith('.txt') ||
+        file.endsWith('.rst')
+    );
+    if (onlyDocs) {
+      return stagedFiles.length === 1
+        ? `docs: update ${stagedFiles[0].split('/').pop() || 'docs'}`
+        : 'docs: update documentation';
+    }
+
+    const hasTests = lowerFiles.some(
+      (file) =>
+        file.includes('/test/') ||
+        file.includes('/tests/') ||
+        file.includes('.test.') ||
+        file.includes('.spec.')
+    );
+    if (hasTests) {
+      return 'test: update coverage for staged changes';
+    }
+
+    const hasFixHint = lowerFiles.some(
+      (file) =>
+        file.includes('fix') ||
+        file.includes('bug') ||
+        file.includes('issue') ||
+        file.includes('error')
+    );
+    if (hasFixHint) {
+      return 'fix: address staged changes';
+    }
+
+    const statsMatch = stagedDiffStat.match(
+      /(\d+)\s+files? changed(?:,\s+(\d+)\s+insertions?\(\+\))?(?:,\s+(\d+)\s+deletions?\(-\))?/i
+    );
+    const fileCount = statsMatch ? parseInt(statsMatch[1] || '0', 10) || stagedFiles.length : stagedFiles.length;
+
+    if (fileCount === 1) {
+      const single = stagedFiles[0].split('/').pop() || stagedFiles[0];
+      return `chore: update ${single.replace(/\.[^.]+$/, '')}`;
+    }
+
+    return `chore: update ${fileCount} files`;
   }
 
   /**

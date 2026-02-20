@@ -207,6 +207,10 @@ declare global {
           deletions: number;
           isStaged: boolean;
           hasUnstaged: boolean;
+          stagedAdditions: number;
+          stagedDeletions: number;
+          unstagedAdditions: number;
+          unstagedDeletions: number;
           diff?: string;
         }>;
         error?: string;
@@ -226,6 +230,13 @@ declare global {
       onGitStatusChanged: (
         listener: (data: { taskPath: string; error?: string }) => void
       ) => () => void;
+      generateCommitMessage?: (args: { taskPath: string }) => Promise<{
+        success: boolean;
+        message?: string;
+        providerId?: string;
+        source?: 'provider' | 'heuristic';
+        error?: string;
+      }>;
       listRemoteBranches: (args: { projectPath: string; remote?: string }) => Promise<{
         success: boolean;
         branches?: Array<{ ref: string; remote: string; branch: string; label: string }>;
