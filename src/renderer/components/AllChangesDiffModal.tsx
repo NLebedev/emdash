@@ -505,17 +505,6 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
       .monaco-diff-editor .monaco-editor .overview-ruler .overview-ruler-content {
         width: 3px !important;
       }
-      /* Hide +/- indicators on the left sidebar - multiple selectors to ensure they're hidden */
-      .monaco-diff-editor .margin-view-overlays .line-insert,
-      .monaco-diff-editor .margin-view-overlays .line-delete,
-      .monaco-diff-editor .margin-view-overlays .codicon-add,
-      .monaco-diff-editor .margin-view-overlays .codicon-remove,
-      .monaco-diff-editor .margin-view-overlays .codicon-diff-added,
-      .monaco-diff-editor .margin-view-overlays .codicon-diff-removed {
-        display: none !important;
-        visibility: hidden !important;
-        opacity: 0 !important;
-      }
       /* Add thin border between line numbers and code content */
       .monaco-diff-editor .modified .margin-view-overlays {
         border-right: 1px solid ${isDark ? 'rgba(156, 163, 175, 0.2)' : 'rgba(107, 114, 128, 0.2)'} !important;
@@ -1070,7 +1059,7 @@ export const AllChangesDiffModal: React.FC<AllChangesDiffModalProps> = ({
                                       wordWrap: 'on',
                                       lineNumbers: 'on',
                                       lineNumbersMinChars: 2, // Reduce line number width for better space usage
-                                      renderIndicators: false, // Hide +/- indicators
+                                      renderIndicators: true,
                                       overviewRulerLanes: 3, // Show overview ruler with change indicators
                                       renderOverviewRuler: true, // Show overview ruler
                                       automaticLayout: true,

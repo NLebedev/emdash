@@ -96,4 +96,19 @@ describe('WorktreePoolService', () => {
     expect(fs.existsSync(settingsPath)).toBe(true);
     expect(fs.readFileSync(settingsPath, 'utf8')).toContain('workspace-write');
   });
+
+  it('creates a reserve even when PATH is oversized', async () => {
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${'x'.repeat(1_600_000)}:/usr/bin:/bin`;
+    try {
+      await pool.ensureReserve('project-oversized-path', projectPath, 'HEAD');
+      expect(pool.hasReserve('project-oversized-path')).toBe(true);
+    } finally {
+      if (typeof originalPath === 'string') {
+        process.env.PATH = originalPath;
+      } else {
+        delete process.env.PATH;
+      }
+    }
+  });
 });
