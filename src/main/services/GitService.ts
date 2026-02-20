@@ -3,10 +3,111 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { buildExternalToolEnv } from '../utils/childProcessEnv';
 
 const execFileAsync = promisify(execFile);
 const MAX_UNTRACKED_LINECOUNT_BYTES = 512 * 1024;
 const MAX_UNTRACKED_DIFF_BYTES = 512 * 1024;
+const GIT_EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+
+function normalizePathForChild(pathValue: string): string {
+  const separator = process.platform === 'win32' ? ';' : ':';
+  const seen = new Set<string>();
+  return pathValue
+    .split(separator)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0 && part.length <= 512)
+    .filter((part) => {
+      const key = process.platform === 'win32' ? part.toLowerCase() : part;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 200)
+    .join(separator);
+}
+
+function buildGitEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const externalEnv = buildExternalToolEnv(baseEnv);
+  const env: NodeJS.ProcessEnv = {};
+  const keys = [
+    'HOME',
+    'USER',
+    'LOGNAME',
+    'SHELL',
+    'SSH_AUTH_SOCK',
+    'LANG',
+    'LC_ALL',
+    'LC_CTYPE',
+    'TMPDIR',
+    'SystemRoot',
+    'COMSPEC',
+    'PATHEXT',
+  ];
+  for (const key of keys) {
+    const value = externalEnv[key];
+    if (typeof value === 'string' && value.length > 0) {
+      env[key] = value;
+    }
+  }
+
+  const normalizedPath = normalizePathForChild(
+    typeof externalEnv.PATH === 'string' ? externalEnv.PATH : ''
+  );
+  const defaultPath =
+    process.platform === 'win32'
+      ? 'C:\\Windows\\System32;C:\\Windows'
+      : '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin';
+  env.PATH = normalizedPath || defaultPath;
+  return env;
+}
+
+function buildMinimalRetryEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = buildGitEnv(baseEnv);
+  const minimal: NodeJS.ProcessEnv = {};
+  for (const key of [
+    'PATH',
+    'HOME',
+    'USER',
+    'LOGNAME',
+    'SHELL',
+    'SSH_AUTH_SOCK',
+    'TMPDIR',
+    'SystemRoot',
+    'COMSPEC',
+    'PATHEXT',
+  ]) {
+    const value = env[key];
+    if (typeof value === 'string' && value.length > 0) {
+      minimal[key] = value;
+    }
+  }
+  return minimal;
+}
+
+async function execGit(
+  taskPath: string,
+  args: string[],
+  options?: { timeout?: number }
+): Promise<{ stdout: string; stderr: string }> {
+  const run = async (env: NodeJS.ProcessEnv) =>
+    (await execFileAsync('git', args, {
+      cwd: taskPath,
+      env,
+      timeout: options?.timeout,
+      maxBuffer: GIT_EXEC_MAX_BUFFER_BYTES,
+    })) as { stdout: string; stderr: string };
+
+  try {
+    return await run(buildGitEnv());
+  } catch (error: any) {
+    const code = error?.code;
+    if (code === 'ENAMETOOLONG' || code === 'E2BIG') {
+      return await run(buildMinimalRetryEnv());
+    }
+    throw error;
+  }
+}
 
 async function countFileNewlinesCapped(filePath: string, maxBytes: number): Promise<number | null> {
   let stat: fs.Stats;
@@ -124,20 +225,16 @@ function parseUnifiedDiff(diffText: string): { fileHeaders: string[]; hunks: Par
 
 export async function getStatus(taskPath: string): Promise<GitChange[]> {
   try {
-    await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd: taskPath,
-    });
+    await execGit(taskPath, ['rev-parse', '--is-inside-work-tree']);
   } catch {
     return [];
   }
 
-  const { stdout: statusOutput } = await execFileAsync(
-    'git',
-    ['status', '--porcelain', '--untracked-files=all'],
-    {
-      cwd: taskPath,
-    }
-  );
+  const { stdout: statusOutput } = await execGit(taskPath, [
+    'status',
+    '--porcelain',
+    '--untracked-files=all',
+  ]);
 
   if (!statusOutput.trim()) return [];
 
@@ -194,9 +291,7 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
     };
 
     try {
-      const staged = await execFileAsync('git', ['diff', '--numstat', '--cached', '--', filePath], {
-        cwd: taskPath,
-      });
+      const staged = await execGit(taskPath, ['diff', '--numstat', '--cached', '--', filePath]);
       if (staged.stdout && staged.stdout.trim()) {
         const parsed = parseNumstat(staged.stdout);
         stagedAdditions = parsed.additions;
@@ -205,9 +300,7 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
     } catch {}
 
     try {
-      const unstaged = await execFileAsync('git', ['diff', '--numstat', '--', filePath], {
-        cwd: taskPath,
-      });
+      const unstaged = await execGit(taskPath, ['diff', '--numstat', '--', filePath]);
       if (unstaged.stdout && unstaged.stdout.trim()) {
         const parsed = parseNumstat(unstaged.stdout);
         unstagedAdditions = parsed.additions;
@@ -245,11 +338,11 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
 }
 
 export async function stageFile(taskPath: string, filePath: string): Promise<void> {
-  await execFileAsync('git', ['add', '--', filePath], { cwd: taskPath });
+  await execGit(taskPath, ['add', '--', filePath]);
 }
 
 export async function stageAllFiles(taskPath: string): Promise<void> {
-  await execFileAsync('git', ['add', '-A'], { cwd: taskPath });
+  await execGit(taskPath, ['add', '-A']);
 }
 
 type DiffRangeScope = 'staged' | 'unstaged';
@@ -271,11 +364,7 @@ async function applyDiffRangeToIndex(
       ? ['diff', '--cached', '--no-color', '--no-ext-diff', '--unified=0', '--', filePath]
       : ['diff', '--no-color', '--no-ext-diff', '--unified=0', '--', filePath];
 
-  const { stdout: rawDiff } = await execFileAsync(
-    'git',
-    diffArgs,
-    { cwd: taskPath }
-  );
+  const { stdout: rawDiff } = await execGit(taskPath, diffArgs);
 
   if (!rawDiff.trim()) {
     return { applied: false, hunks: 0 };
@@ -314,11 +403,7 @@ async function applyDiffRangeToIndex(
       applyArgs.push('--reverse');
     }
     applyArgs.push(tempPatchPath);
-    await execFileAsync(
-      'git',
-      applyArgs,
-      { cwd: taskPath }
-    );
+    await execGit(taskPath, applyArgs);
   } finally {
     try {
       await fs.promises.unlink(tempPatchPath);
@@ -358,7 +443,7 @@ export async function unstageDiffRange(
 }
 
 export async function unstageFile(taskPath: string, filePath: string): Promise<void> {
-  await execFileAsync('git', ['reset', 'HEAD', '--', filePath], { cwd: taskPath });
+  await execGit(taskPath, ['reset', 'HEAD', '--', filePath]);
 }
 
 export async function revertFile(
@@ -367,17 +452,17 @@ export async function revertFile(
 ): Promise<{ action: 'unstaged' | 'reverted' }> {
   // Check if file is staged
   try {
-    const { stdout: stagedStatus } = await execFileAsync(
-      'git',
-      ['diff', '--cached', '--name-only', '--', filePath],
-      {
-        cwd: taskPath,
-      }
-    );
+    const { stdout: stagedStatus } = await execGit(taskPath, [
+      'diff',
+      '--cached',
+      '--name-only',
+      '--',
+      filePath,
+    ]);
 
     if (stagedStatus.trim()) {
       // File is staged, unstage it (but keep working directory changes)
-      await execFileAsync('git', ['reset', 'HEAD', '--', filePath], { cwd: taskPath });
+      await execGit(taskPath, ['reset', 'HEAD', '--', filePath]);
       return { action: 'unstaged' };
     }
   } catch {}
@@ -385,7 +470,7 @@ export async function revertFile(
   // Check if file is tracked in git (exists in HEAD)
   let fileExistsInHead = false;
   try {
-    await execFileAsync('git', ['cat-file', '-e', `HEAD:${filePath}`], { cwd: taskPath });
+    await execGit(taskPath, ['cat-file', '-e', `HEAD:${filePath}`]);
     fileExistsInHead = true;
   } catch {
     // File doesn't exist in HEAD (it's a new/untracked file), delete it
@@ -399,7 +484,7 @@ export async function revertFile(
   // File exists in HEAD, revert it
   if (fileExistsInHead) {
     try {
-      await execFileAsync('git', ['checkout', 'HEAD', '--', filePath], { cwd: taskPath });
+      await execGit(taskPath, ['checkout', 'HEAD', '--', filePath]);
     } catch (error) {
       // If checkout fails, don't delete the file - throw the error instead
       throw new Error(
@@ -465,9 +550,7 @@ export async function getFileDiff(
   scope: GitDiffScope = 'all'
 ): Promise<{ lines: GitDiffLine[] }> {
   try {
-    const { stdout } = await execFileAsync('git', getDiffArgs(filePath, scope), {
-      cwd: taskPath,
-    });
+    const { stdout } = await execGit(taskPath, getDiffArgs(filePath, scope));
     const parsed = parseDiffOutput(stdout);
     if (parsed.length > 0) {
       return { lines: parsed };
@@ -486,9 +569,7 @@ export async function getFileDiff(
 
   if (scope === 'unstaged') {
     try {
-      const { stdout: indexContent } = await execFileAsync('git', ['show', `:${filePath}`], {
-        cwd: taskPath,
-      });
+      const { stdout: indexContent } = await execGit(taskPath, ['show', `:${filePath}`]);
       return { lines: toDeletedLines(indexContent) };
     } catch {
       return { lines: [] };
@@ -497,11 +578,9 @@ export async function getFileDiff(
 
   if (scope === 'staged') {
     try {
-      const { stdout: indexContent } = await execFileAsync('git', ['show', `:${filePath}`], {
-        cwd: taskPath,
-      });
+      const { stdout: indexContent } = await execGit(taskPath, ['show', `:${filePath}`]);
       try {
-        await execFileAsync('git', ['cat-file', '-e', `HEAD:${filePath}`], { cwd: taskPath });
+        await execGit(taskPath, ['cat-file', '-e', `HEAD:${filePath}`]);
         // File exists in HEAD and no parsed diff means there are no staged changes for this file.
         return { lines: [] };
       } catch {
@@ -511,9 +590,7 @@ export async function getFileDiff(
     } catch {
       try {
         // File missing from index but present in HEAD -> staged delete.
-        const { stdout: headContent } = await execFileAsync('git', ['show', `HEAD:${filePath}`], {
-          cwd: taskPath,
-        });
+        const { stdout: headContent } = await execGit(taskPath, ['show', `HEAD:${filePath}`]);
         return { lines: toDeletedLines(headContent) };
       } catch {
         return { lines: [] };
@@ -522,9 +599,7 @@ export async function getFileDiff(
   }
 
   try {
-    const { stdout: headContent } = await execFileAsync('git', ['show', `HEAD:${filePath}`], {
-      cwd: taskPath,
-    });
+    const { stdout: headContent } = await execGit(taskPath, ['show', `HEAD:${filePath}`]);
     return { lines: toDeletedLines(headContent) };
   } catch {
     return { lines: [] };

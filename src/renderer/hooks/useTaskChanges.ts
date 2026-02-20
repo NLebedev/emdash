@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getCachedGitStatus } from '@/lib/gitStatusCache';
 
 export interface TaskChange {
   path: string;
@@ -87,7 +86,7 @@ export function useTaskChanges(
         }
 
         const requestPath = currentPath;
-        const result = await getCachedGitStatus(requestPath, { force: options?.force });
+        const result = await window.electronAPI.getGitStatus(requestPath);
 
         if (!mountedRef.current) return;
 
