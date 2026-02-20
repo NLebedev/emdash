@@ -1,112 +1,20 @@
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { buildExternalToolEnv } from '../utils/childProcessEnv';
+import { execGit as execGitCommand, DEFAULT_GIT_MAX_BUFFER_BYTES } from '../utils/gitExec';
 
-const execFileAsync = promisify(execFile);
 const MAX_UNTRACKED_LINECOUNT_BYTES = 512 * 1024;
 const MAX_UNTRACKED_DIFF_BYTES = 512 * 1024;
-const GIT_EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
-
-function normalizePathForChild(pathValue: string): string {
-  const separator = process.platform === 'win32' ? ';' : ':';
-  const seen = new Set<string>();
-  return pathValue
-    .split(separator)
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0 && part.length <= 512)
-    .filter((part) => {
-      const key = process.platform === 'win32' ? part.toLowerCase() : part;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 200)
-    .join(separator);
-}
-
-function buildGitEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const externalEnv = buildExternalToolEnv(baseEnv);
-  const env: NodeJS.ProcessEnv = {};
-  const keys = [
-    'HOME',
-    'USER',
-    'LOGNAME',
-    'SHELL',
-    'SSH_AUTH_SOCK',
-    'LANG',
-    'LC_ALL',
-    'LC_CTYPE',
-    'TMPDIR',
-    'SystemRoot',
-    'COMSPEC',
-    'PATHEXT',
-  ];
-  for (const key of keys) {
-    const value = externalEnv[key];
-    if (typeof value === 'string' && value.length > 0) {
-      env[key] = value;
-    }
-  }
-
-  const normalizedPath = normalizePathForChild(
-    typeof externalEnv.PATH === 'string' ? externalEnv.PATH : ''
-  );
-  const defaultPath =
-    process.platform === 'win32'
-      ? 'C:\\Windows\\System32;C:\\Windows'
-      : '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin';
-  env.PATH = normalizedPath || defaultPath;
-  return env;
-}
-
-function buildMinimalRetryEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const env = buildGitEnv(baseEnv);
-  const minimal: NodeJS.ProcessEnv = {};
-  for (const key of [
-    'PATH',
-    'HOME',
-    'USER',
-    'LOGNAME',
-    'SHELL',
-    'SSH_AUTH_SOCK',
-    'TMPDIR',
-    'SystemRoot',
-    'COMSPEC',
-    'PATHEXT',
-  ]) {
-    const value = env[key];
-    if (typeof value === 'string' && value.length > 0) {
-      minimal[key] = value;
-    }
-  }
-  return minimal;
-}
 
 async function execGit(
   taskPath: string,
   args: string[],
   options?: { timeout?: number }
 ): Promise<{ stdout: string; stderr: string }> {
-  const run = async (env: NodeJS.ProcessEnv) =>
-    (await execFileAsync('git', args, {
-      cwd: taskPath,
-      env,
-      timeout: options?.timeout,
-      maxBuffer: GIT_EXEC_MAX_BUFFER_BYTES,
-    })) as { stdout: string; stderr: string };
-
-  try {
-    return await run(buildGitEnv());
-  } catch (error: any) {
-    const code = error?.code;
-    if (code === 'ENAMETOOLONG' || code === 'E2BIG') {
-      return await run(buildMinimalRetryEnv());
-    }
-    throw error;
-  }
+  return execGitCommand(args, taskPath, {
+    timeout: options?.timeout,
+    maxBuffer: DEFAULT_GIT_MAX_BUFFER_BYTES,
+  });
 }
 
 async function countFileNewlinesCapped(filePath: string, maxBytes: number): Promise<number | null> {

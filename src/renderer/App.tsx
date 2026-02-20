@@ -19,7 +19,6 @@ import Titlebar from './components/titlebar/Titlebar';
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from './components/ui/resizable';
 import { RightSidebarProvider, useRightSidebar } from './components/ui/right-sidebar';
 import { SidebarProvider } from './components/ui/sidebar';
-import DiffSmokeHarness from './components/e2e/DiffSmokeHarness';
 import { KeyboardSettingsProvider } from './contexts/KeyboardSettingsContext';
 import { ToastAction } from './components/ui/toast';
 import { Toaster } from './components/ui/toaster';
@@ -54,6 +53,8 @@ import {
   RIGHT_SIDEBAR_MAX_SIZE,
   MAIN_PANEL_MIN_SIZE,
 } from './constants/layout';
+
+const DiffSmokeHarness = React.lazy(() => import('./components/e2e/DiffSmokeHarness'));
 
 const PINNED_TASKS_KEY = 'emdash-pinned-tasks';
 const PANEL_RESIZE_DRAGGING_EVENT = 'emdash:panel-resize-dragging';
@@ -761,7 +762,13 @@ const App: React.FC = () => {
   return (
     <ThemeProvider>
       <ErrorBoundary>
-        {isDiffSmokeRoute ? <DiffSmokeHarness /> : <AppContent />}
+        {isDiffSmokeRoute ? (
+          <React.Suspense fallback={null}>
+            <DiffSmokeHarness />
+          </React.Suspense>
+        ) : (
+          <AppContent />
+        )}
       </ErrorBoundary>
     </ThemeProvider>
   );

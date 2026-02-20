@@ -1,13 +1,9 @@
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { log } from '../lib/logger';
 import { worktreeService, type WorktreeInfo } from './WorktreeService';
-import { buildExternalToolEnv } from '../utils/childProcessEnv';
-
-const execFileAsync = promisify(execFile);
+import { execGit as execGitCommand } from '../utils/gitExec';
 
 interface ReserveWorktree {
   id: string;
@@ -41,68 +37,6 @@ export class WorktreePoolService {
   // 30 minutes is reasonable since users don't create tasks that frequently
   private readonly MAX_RESERVE_AGE_MS = 30 * 60 * 1000; // 30 minutes
 
-  private normalizePathForChild(pathValue: string): string {
-    const separator = process.platform === 'win32' ? ';' : ':';
-    const seen = new Set<string>();
-    return pathValue
-      .split(separator)
-      .map((part) => part.trim())
-      .filter((part) => part.length > 0 && part.length <= 512)
-      .filter((part) => {
-        const key = process.platform === 'win32' ? part.toLowerCase() : part;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, 200)
-      .join(separator);
-  }
-
-  private buildGitEnv(): NodeJS.ProcessEnv {
-    const baseEnv = buildExternalToolEnv(process.env);
-    const env: NodeJS.ProcessEnv = {};
-    const keys = [
-      'HOME',
-      'USER',
-      'LOGNAME',
-      'SHELL',
-      'SSH_AUTH_SOCK',
-      'LANG',
-      'LC_ALL',
-      'LC_CTYPE',
-      'TMPDIR',
-      'SystemRoot',
-      'COMSPEC',
-      'PATHEXT',
-    ];
-    for (const key of keys) {
-      const value = baseEnv[key];
-      if (typeof value === 'string' && value.length > 0) {
-        env[key] = value;
-      }
-    }
-
-    const normalizedPath = this.normalizePathForChild(typeof baseEnv.PATH === 'string' ? baseEnv.PATH : '');
-    const defaultPath =
-      process.platform === 'win32'
-        ? 'C:\\Windows\\System32;C:\\Windows'
-        : '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin';
-    env.PATH = normalizedPath || defaultPath;
-    return env;
-  }
-
-  private buildMinimalRetryEnv(): NodeJS.ProcessEnv {
-    const env = this.buildGitEnv();
-    const minimal: NodeJS.ProcessEnv = {};
-    for (const key of ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'SSH_AUTH_SOCK', 'TMPDIR']) {
-      const value = env[key];
-      if (typeof value === 'string' && value.length > 0) {
-        minimal[key] = value;
-      }
-    }
-    return minimal;
-  }
-
   private async execGit(
     args: string[],
     cwd: string,
@@ -111,27 +45,15 @@ export class WorktreePoolService {
     stdout: string;
     stderr: string;
   }> {
-    try {
-      return (await execFileAsync('git', args, {
-        cwd,
-        env: this.buildGitEnv(),
-        timeout,
-      })) as { stdout: string; stderr: string };
-    } catch (error: any) {
-      const code = error?.code;
-      if (code === 'ENAMETOOLONG' || code === 'E2BIG') {
+    return execGitCommand(args, cwd, {
+      timeout,
+      onRetryOversizedEnv: (code) => {
         log.warn('WorktreePool: git spawn failed with oversized env, retrying with minimal env', {
           cwd,
           code,
         });
-        return (await execFileAsync('git', args, {
-          cwd,
-          env: this.buildMinimalRetryEnv(),
-          timeout,
-        })) as { stdout: string; stderr: string };
-      }
-      throw error;
-    }
+      },
+    });
   }
 
   /** Generate a unique hash for reserve identification */
