@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUpRight, GitBranch, GripVertical, Layers, Plus } from 'lucide-react';
+import { ArrowUpRight, ChevronLeft, ChevronRight, GripVertical, Layers, Plus } from 'lucide-react';
 import { makePtyId } from '@shared/ptyId';
 import { getTaskEnvVars } from '@shared/task/envVars';
 import { PROVIDER_IDS, type ProviderId } from '@shared/providers/registry';
@@ -12,6 +12,7 @@ import { cn } from '@/lib/utils';
 import { useTaskBusy } from '../hooks/useTaskBusy';
 import { useTheme } from '../hooks/useTheme';
 import { agentConfig } from '../lib/agentConfig';
+import { extractDroppedFilePaths, hasFilesInDataTransfer } from '../lib/dndFilePaths';
 import { agentMeta } from '../providers/meta';
 import type { Project, Task } from '../types/app';
 
@@ -24,18 +25,80 @@ const GRID_SLOT_COUNT_KEY = 'taskGrid:slotCount';
 const GRID_ORDER_PROJECT_KEY = (projectId: string) => `taskGrid:order:project:${projectId}`;
 const GRID_ORDER_ALL_KEY = 'taskGrid:order:all-projects';
 
-const GRID_COLUMNS_CLASS: Record<GridSlotCount, string> = {
-  2: 'grid-cols-1 xl:grid-cols-2',
-  4: 'grid-cols-1 md:grid-cols-2',
-  6: 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3',
-  9: 'grid-cols-1 md:grid-cols-3',
+const GRID_LAYOUT: Record<GridSlotCount, { columns: number; rows: number }> = {
+  2: { columns: 2, rows: 1 },
+  4: { columns: 2, rows: 2 },
+  6: { columns: 3, rows: 2 },
+  9: { columns: 3, rows: 3 },
 };
 
-const GRID_TILE_HEIGHT_CLASS: Record<GridSlotCount, string> = {
-  2: 'h-[clamp(520px,74vh,920px)]',
-  4: 'h-[clamp(290px,42vh,560px)]',
-  6: 'h-[clamp(240px,34vh,460px)]',
-  9: 'h-[clamp(190px,28vh,340px)]',
+const MIN_COLUMN_SIZE_PX = 220;
+const MIN_ROW_SIZE_PX = 140;
+const RESIZE_HANDLE_SIZE_PX = 8;
+
+const createEqualFractions = (count: number): number[] =>
+  count <= 0 ? [] : Array.from({ length: count }, () => 1 / count);
+
+const normalizeFractions = (fractions: number[], expectedCount: number): number[] => {
+  if (expectedCount <= 0) return [];
+
+  if (fractions.length !== expectedCount) {
+    return createEqualFractions(expectedCount);
+  }
+
+  const cleaned = fractions.map((value) => (Number.isFinite(value) && value > 0 ? value : 0));
+  const total = cleaned.reduce((sum, value) => sum + value, 0);
+  if (total <= 0) return createEqualFractions(expectedCount);
+  return cleaned.map((value) => value / total);
+};
+
+const fractionsEqual = (left: number[], right: number[]) => {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (Math.abs(left[index] - right[index]) > 0.0001) {
+      return false;
+    }
+  }
+  return true;
+};
+
+const getBoundaryPercents = (fractions: number[]) => {
+  let running = 0;
+  const boundaries: number[] = [];
+  for (let index = 0; index < fractions.length - 1; index += 1) {
+    running += fractions[index];
+    boundaries.push(running * 100);
+  }
+  return boundaries;
+};
+
+const getVisiblePageIndexes = (pageCount: number, activePageIndex: number) => {
+  if (pageCount <= 7) {
+    return Array.from({ length: pageCount }, (_, index) => index);
+  }
+
+  const windowSize = 5;
+  const startIndex = Math.max(0, Math.min(activePageIndex - 2, pageCount - windowSize));
+  return Array.from({ length: windowSize }, (_, offset) => startIndex + offset);
+};
+
+const escapeShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+
+const sendEscapedPathsToPty = (ptyId: string, paths: string[]) => {
+  if (paths.length === 0) return;
+  const escaped = paths.map((path) => escapeShellArg(path)).join(' ');
+  window.electronAPI.ptyInput({ id: ptyId, data: `${escaped} ` });
+};
+
+type ResizeAxis = 'column' | 'row';
+
+type ResizeDragState = {
+  axis: ResizeAxis;
+  boundaryIndex: number;
+  startPointer: number;
+  containerSize: number;
+  startBeforePx: number;
+  startAfterPx: number;
 };
 
 type TerminalTarget = {
@@ -80,7 +143,10 @@ const buildMainTarget = (taskId: string, provider: ProviderId): TerminalTarget =
   provider,
 });
 
-async function resolveTerminalTarget(taskId: string, taskAgentId?: string): Promise<TerminalTarget> {
+async function resolveTerminalTarget(
+  taskId: string,
+  taskAgentId?: string
+): Promise<TerminalTarget> {
   const fallbackProvider = resolveStoredProvider(taskId, taskAgentId);
 
   try {
@@ -172,8 +238,7 @@ const SplitButton: React.FC<{
   active: boolean;
   onClick: () => void;
 }> = ({ option, active, onClick }) => {
-  const gridColsClass =
-    option === 2 ? 'grid-cols-2' : option === 4 ? 'grid-cols-2' : 'grid-cols-3';
+  const gridColsClass = option === 2 ? 'grid-cols-2' : option === 4 ? 'grid-cols-2' : 'grid-cols-3';
 
   return (
     <button
@@ -193,7 +258,7 @@ const SplitButton: React.FC<{
           <span
             key={`${option}-${index}`}
             className={cn(
-              'rounded-[1px] border border-current/40',
+              'border-current/40 rounded-[1px] border',
               active ? 'bg-current/80' : 'bg-current/30'
             )}
           />
@@ -208,7 +273,6 @@ interface TaskTerminalTileProps {
   item: GridTaskItem;
   active: boolean;
   isDropTarget: boolean;
-  tileHeightClass: string;
   showProjectBadge: boolean;
   onSelectTaskInProject: (project: Project, task: Task) => void;
   onOpenTaskInProject: (project: Project, task: Task) => void;
@@ -223,7 +287,6 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
   item,
   active,
   isDropTarget,
-  tileHeightClass,
   showProjectBadge,
   onSelectTaskInProject,
   onOpenTaskInProject,
@@ -302,17 +365,61 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
     Boolean(item.task.metadata?.autoApprove) && Boolean(agentMeta[provider]?.autoApproveFlag);
   const isMultiAgentTask = Boolean(item.task.metadata?.multiAgent?.enabled);
 
+  const handleTileDragOver = (event: React.DragEvent<HTMLElement>) => {
+    if (hasFilesInDataTransfer(event.dataTransfer)) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+      return;
+    }
+
+    onDragOverSlot(slotIndex, event);
+  };
+
+  const sendPathsToTerminal = async (paths: string[]) => {
+    if (!target || paths.length === 0) return;
+
+    if (item.projectRemoteConnectionId) {
+      try {
+        const result = await window.electronAPI.ptyScpToRemote({
+          connectionId: item.projectRemoteConnectionId,
+          localPaths: paths,
+        });
+        if (!result.success || !result.remotePaths) return;
+        const remotePaths = result.remotePaths.filter((path): path is string => Boolean(path));
+        sendEscapedPathsToPty(target.id, remotePaths);
+      } catch {
+        // Ignore transfer errors.
+      }
+      return;
+    }
+
+    sendEscapedPathsToPty(target.id, paths);
+  };
+
+  const handleTileDrop = (event: React.DragEvent<HTMLElement>) => {
+    if (event.defaultPrevented) return;
+
+    const droppedPaths = extractDroppedFilePaths(event.dataTransfer, (file) =>
+      window.electronAPI.resolveFilePath?.(file)
+    );
+    if (droppedPaths.length > 0) {
+      event.preventDefault();
+      void sendPathsToTerminal(droppedPaths);
+      return;
+    }
+
+    onDropSlot(slotIndex);
+  };
+
   return (
     <section
       className={cn(
-        'flex min-h-0 flex-col overflow-hidden rounded-xl border bg-card shadow-sm transition-colors',
-        tileHeightClass,
-        active ? 'border-primary' : 'border-border',
-        needsAttention && 'border-orange-400/80 bg-orange-500/10',
-        isDropTarget && 'ring-2 ring-primary/60 ring-offset-2 ring-offset-background'
+        'flex h-full min-h-0 w-full flex-col overflow-hidden bg-card transition-colors',
+        needsAttention && 'bg-orange-500/10',
+        isDropTarget && 'ring-2 ring-inset ring-primary/60'
       )}
-      onDragOver={(event) => onDragOverSlot(slotIndex, event)}
-      onDrop={() => onDropSlot(slotIndex)}
+      onDragOver={handleTileDragOver}
+      onDrop={handleTileDrop}
       onMouseDownCapture={() => {
         clearAttention();
         if (!active) {
@@ -322,46 +429,12 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
     >
       <header
         className={cn(
-          'flex items-start justify-between gap-3 border-b border-border bg-muted/30 px-3 py-2.5',
+          'flex h-[clamp(46px,6.2vh,62px)] items-center justify-between gap-1.5 overflow-hidden border-b border-border bg-muted/30 px-2.5 py-0.5 transition-colors',
+          active && 'bg-accent/70',
           needsAttention && 'bg-orange-500/15'
         )}
       >
-        <div className="min-w-0 space-y-1">
-          <div className="truncate text-sm font-medium text-foreground">{item.task.name}</div>
-          <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-            <GitBranch className="h-3 w-3" />
-            <span className="truncate font-mono">origin/{item.task.branch}</span>
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-            {providerInfo?.logo ? (
-              <AgentLogo
-                logo={providerInfo.logo}
-                alt={providerInfo.alt}
-                isSvg={providerInfo.isSvg}
-                invertInDark={providerInfo.invertInDark}
-                className="h-3.5 w-3.5"
-              />
-            ) : null}
-            <span className="truncate">{providerInfo?.name || provider}</span>
-            {showProjectBadge ? (
-              <span className="rounded border border-border bg-muted/60 px-1 py-0.5 text-[10px] text-muted-foreground">
-                {item.project.name}
-              </span>
-            ) : null}
-            {autoApproveEnabled ? (
-              <span className="rounded bg-orange-500/15 px-1 py-0.5 text-[10px] text-orange-600">
-                Auto
-              </span>
-            ) : null}
-            {needsAttention ? (
-              <span className="rounded bg-orange-500/20 px-1 py-0.5 text-[10px] font-medium text-orange-700">
-                Needs input
-              </span>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
           <button
             type="button"
             draggable
@@ -372,26 +445,62 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
             }}
             onDragEnd={onDragHandleEnd}
             onMouseDown={(event) => event.stopPropagation()}
-            className="inline-flex h-7 w-7 items-center justify-center rounded border border-border bg-background text-muted-foreground hover:bg-muted"
+            className="inline-flex h-5 w-5 shrink-0 cursor-grab items-center justify-center rounded-sm border border-border bg-background text-muted-foreground hover:bg-muted active:cursor-grabbing"
             title="Drag to reorder"
             aria-label={`Drag task ${item.task.name}`}
           >
-            <GripVertical className="h-3.5 w-3.5" />
+            <GripVertical className="h-2.5 w-2.5" />
           </button>
-          {busy ? <Spinner size="sm" className="h-3.5 w-3.5 text-muted-foreground" /> : null}
+          <div className="min-w-0 flex-1 overflow-hidden">
+            <div className="truncate text-[12px] font-medium leading-tight text-foreground">
+              {item.task.name}
+            </div>
+            <div className="flex items-center gap-1 overflow-hidden whitespace-nowrap text-[9px] text-muted-foreground">
+              {providerInfo?.logo ? (
+                <AgentLogo
+                  logo={providerInfo.logo}
+                  alt={providerInfo.alt}
+                  isSvg={providerInfo.isSvg}
+                  invertInDark={providerInfo.invertInDark}
+                  className="h-3 w-3"
+                />
+              ) : null}
+              <span className="min-w-0 truncate">{providerInfo?.name || provider}</span>
+              {showProjectBadge ? (
+                <span className="max-w-[7rem] shrink-0 truncate rounded-sm border border-border bg-muted/60 px-1 py-0 text-[9px] text-muted-foreground">
+                  {item.project.name}
+                </span>
+              ) : null}
+              {autoApproveEnabled ? (
+                <span className="shrink-0 rounded-sm bg-orange-500/15 px-1 py-0 text-[9px] text-orange-600">
+                  Auto
+                </span>
+              ) : null}
+              {needsAttention ? (
+                <span className="shrink-0 rounded-sm bg-orange-500/20 px-1 py-0 text-[9px] font-medium text-orange-700">
+                  Needs input
+                </span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-0.5">
+          {busy ? <Spinner size="sm" className="h-3 w-3 text-muted-foreground" /> : null}
           <Button
             type="button"
             variant="ghost"
             size="sm"
-            className="h-7 px-2 text-xs"
+            className="h-5 w-5 p-0"
             onClick={(event) => {
               event.stopPropagation();
               clearAttention();
               onOpenTaskInProject(item.project, item.task);
             }}
+            title={`Open ${item.task.name}`}
+            aria-label={`Open ${item.task.name}`}
           >
-            Open
-            <ArrowUpRight className="ml-1 h-3 w-3" />
+            <ArrowUpRight className="h-3 w-3" />
           </Button>
         </div>
       </header>
@@ -437,22 +546,40 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
 
 const EmptySlotCard: React.FC<{
   slotIndex: number;
-  tileHeightClass: string;
   isDropTarget: boolean;
   onCreateTaskInSlot: (slotIndex: number) => void;
   onDragOverSlot: (index: number, event: React.DragEvent<HTMLElement>) => void;
   onDropSlot: (index: number) => void;
-}> = ({ slotIndex, tileHeightClass, isDropTarget, onCreateTaskInSlot, onDragOverSlot, onDropSlot }) => {
+}> = ({ slotIndex, isDropTarget, onCreateTaskInSlot, onDragOverSlot, onDropSlot }) => {
+  const handleDragOver = (event: React.DragEvent<HTMLButtonElement>) => {
+    if (hasFilesInDataTransfer(event.dataTransfer)) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+      return;
+    }
+    onDragOverSlot(slotIndex, event);
+  };
+
+  const handleDrop = (event: React.DragEvent<HTMLButtonElement>) => {
+    const droppedPaths = extractDroppedFilePaths(event.dataTransfer, (file) =>
+      window.electronAPI.resolveFilePath?.(file)
+    );
+    if (droppedPaths.length > 0) {
+      event.preventDefault();
+      return;
+    }
+    onDropSlot(slotIndex);
+  };
+
   return (
     <button
       type="button"
       onClick={() => onCreateTaskInSlot(slotIndex)}
-      onDragOver={(event) => onDragOverSlot(slotIndex, event)}
-      onDrop={() => onDropSlot(slotIndex)}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
       className={cn(
-        'flex min-h-0 items-center justify-center rounded-xl border border-dashed border-border bg-muted/20 text-muted-foreground transition-colors hover:bg-muted/35',
-        tileHeightClass,
-        isDropTarget && 'ring-2 ring-primary/60 ring-offset-2 ring-offset-background'
+        'flex h-full min-h-0 w-full items-center justify-center border border-dashed border-border bg-muted/20 text-muted-foreground transition-colors hover:bg-muted/35',
+        isDropTarget && 'ring-2 ring-inset ring-primary/60'
       )}
       aria-label={`Create task in slot ${slotIndex + 1}`}
       title="Create task"
@@ -492,15 +619,40 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
   const [scopeProjectId, setScopeProjectId] = useState<string | null>(null);
   const [slotCount, setSlotCount] = useState<GridSlotCount>(4);
   const [orderedItemKeys, setOrderedItemKeys] = useState<string[]>([]);
+  const [pageIndex, setPageIndex] = useState(0);
   const [draggedItemKey, setDraggedItemKey] = useState<string | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [pendingCreateSlot, setPendingCreateSlot] = useState<{ index: number } | null>(null);
   const [projectPickerSlotIndex, setProjectPickerSlotIndex] = useState<number | null>(null);
+  const [columnFractions, setColumnFractions] = useState<number[]>(createEqualFractions(2));
+  const [rowFractions, setRowFractions] = useState<number[]>(createEqualFractions(2));
   const prevScopedKeysRef = useRef<string[]>([]);
+  const gridSurfaceRef = useRef<HTMLDivElement | null>(null);
+  const resizeDragRef = useRef<ResizeDragState | null>(null);
+  const resizeMoveListenerRef = useRef<((event: PointerEvent) => void) | null>(null);
+  const resizeUpListenerRef = useRef<((event: PointerEvent) => void) | null>(null);
+  const gridLayout = GRID_LAYOUT[slotCount];
 
   useEffect(() => {
     setScopeProjectId(loadGridScopeProjectId());
     setSlotCount(loadGridSlotCount());
+  }, []);
+
+  const clearResizeListeners = () => {
+    if (resizeMoveListenerRef.current) {
+      window.removeEventListener('pointermove', resizeMoveListenerRef.current);
+      resizeMoveListenerRef.current = null;
+    }
+    if (resizeUpListenerRef.current) {
+      window.removeEventListener('pointerup', resizeUpListenerRef.current);
+      resizeUpListenerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      clearResizeListeners();
+    };
   }, []);
 
   useEffect(() => {
@@ -551,10 +703,13 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
   useEffect(() => {
     setOrderedItemKeys(loadTaskOrder(orderStorageKey));
     prevScopedKeysRef.current = scopedItemKeys;
+    setPageIndex(0);
     setDragOverIndex(null);
     setDraggedItemKey(null);
     setPendingCreateSlot(null);
     setProjectPickerSlotIndex(null);
+    resizeDragRef.current = null;
+    clearResizeListeners();
   }, [orderStorageKey, scopedItemKeys]);
 
   useEffect(() => {
@@ -572,6 +727,17 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
       // Ignore localStorage failures.
     }
   }, [slotCount]);
+
+  useEffect(() => {
+    setColumnFractions((current) => {
+      const next = normalizeFractions(current, gridLayout.columns);
+      return fractionsEqual(current, next) ? current : next;
+    });
+    setRowFractions((current) => {
+      const next = normalizeFractions(current, gridLayout.rows);
+      return fractionsEqual(current, next) ? current : next;
+    });
+  }, [gridLayout.columns, gridLayout.rows]);
 
   useEffect(() => {
     try {
@@ -592,10 +758,7 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
       const missing = scopedItemKeys.filter((key) => !filtered.includes(key));
       let next = [...filtered, ...missing];
 
-      if (
-        pendingCreateSlot &&
-        newlyAddedKeys.length > 0
-      ) {
+      if (pendingCreateSlot && newlyAddedKeys.length > 0) {
         const createdAtByKey = new Map(
           scopedItems.map((item) => [item.key, new Date(item.task.createdAt || 0).getTime() || 0])
         );
@@ -629,8 +792,41 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
     return [...fromSavedOrder, ...missing];
   }, [orderedItemKeys, itemByKey, scopedItems]);
 
-  const displayCount = Math.max(slotCount, orderedItems.length);
-  const isTwoSlotExpanded = slotCount === 2 && displayCount <= 2;
+  const displayCount = slotCount;
+  const pageCount = Math.max(1, Math.ceil(orderedItems.length / slotCount));
+  const pageStartIndex = pageIndex * slotCount;
+  const pageEndIndex = pageStartIndex + slotCount;
+  const pagedItems = useMemo(
+    () => orderedItems.slice(pageStartIndex, pageEndIndex),
+    [orderedItems, pageStartIndex, pageEndIndex]
+  );
+
+  const normalizedColumnFractions = useMemo(
+    () => normalizeFractions(columnFractions, gridLayout.columns),
+    [columnFractions, gridLayout.columns]
+  );
+  const normalizedRowFractions = useMemo(
+    () => normalizeFractions(rowFractions, gridLayout.rows),
+    [rowFractions, gridLayout.rows]
+  );
+  const columnBoundaryPercents = useMemo(
+    () => getBoundaryPercents(normalizedColumnFractions),
+    [normalizedColumnFractions]
+  );
+  const rowBoundaryPercents = useMemo(
+    () => getBoundaryPercents(normalizedRowFractions),
+    [normalizedRowFractions]
+  );
+  const visiblePageIndexes = useMemo(
+    () => getVisiblePageIndexes(pageCount, pageIndex),
+    [pageCount, pageIndex]
+  );
+  const visibleStart = orderedItems.length === 0 ? 0 : pageStartIndex + 1;
+  const visibleEnd = Math.min(pageStartIndex + displayCount, orderedItems.length);
+
+  useEffect(() => {
+    setPageIndex((current) => Math.min(current, pageCount - 1));
+  }, [pageCount]);
 
   const handleDragOverSlot = (index: number, event: React.DragEvent<HTMLElement>) => {
     if (!draggedItemKey) return;
@@ -643,12 +839,14 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
 
   const handleDropSlot = (index: number) => {
     if (!draggedItemKey) return;
+    // TODO: support dragging across pages (e.g., drag-hover pager to switch pages).
+    const absoluteTargetIndex = pageStartIndex + index;
     setOrderedItemKeys((current) => {
       const normalized = dedupeIds([
         ...current.filter((key) => itemByKey.has(key)),
         ...scopedItems.map((item) => item.key),
       ]).filter((key) => itemByKey.has(key));
-      return moveIdToIndex(normalized, draggedItemKey, index);
+      return moveIdToIndex(normalized, draggedItemKey, absoluteTargetIndex);
     });
     setDragOverIndex(null);
     setDraggedItemKey(null);
@@ -660,22 +858,103 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
   };
 
   const handleCreateTaskInSlot = (slotIndex: number) => {
+    const absoluteIndex = pageStartIndex + slotIndex;
+
     if (scopeProjectId === null && projects.length > 1) {
-      setProjectPickerSlotIndex(slotIndex);
+      setProjectPickerSlotIndex(absoluteIndex);
       return;
     }
 
     if (scopeProjectId === null) {
       const onlyProject = projects[0] || project;
-      triggerCreateTask(onlyProject, slotIndex);
+      triggerCreateTask(onlyProject, absoluteIndex);
       return;
     }
 
-    const scopedProject = projects.find((projectItem) => projectItem.id === scopeProjectId) || project;
-    triggerCreateTask(scopedProject, slotIndex);
+    const scopedProject =
+      projects.find((projectItem) => projectItem.id === scopeProjectId) || project;
+    triggerCreateTask(scopedProject, absoluteIndex);
   };
 
-  const tileHeightClass = isTwoSlotExpanded ? 'h-full' : GRID_TILE_HEIGHT_CLASS[slotCount];
+  const startResize = (
+    axis: ResizeAxis,
+    boundaryIndex: number,
+    event: React.PointerEvent<HTMLDivElement>
+  ) => {
+    if (event.button !== 0) return;
+
+    const surface = gridSurfaceRef.current;
+    if (!surface) return;
+
+    const rect = surface.getBoundingClientRect();
+    const containerSize = axis === 'column' ? rect.width : rect.height;
+    if (!Number.isFinite(containerSize) || containerSize <= 0) return;
+
+    const fractions = axis === 'column' ? normalizedColumnFractions : normalizedRowFractions;
+    if (boundaryIndex < 0 || boundaryIndex >= fractions.length - 1) return;
+
+    const startBeforePx = fractions[boundaryIndex] * containerSize;
+    const startAfterPx = fractions[boundaryIndex + 1] * containerSize;
+    if (startBeforePx <= 0 || startAfterPx <= 0) return;
+
+    clearResizeListeners();
+    resizeDragRef.current = {
+      axis,
+      boundaryIndex,
+      startPointer: axis === 'column' ? event.clientX : event.clientY,
+      containerSize,
+      startBeforePx,
+      startAfterPx,
+    };
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const drag = resizeDragRef.current;
+      if (!drag) return;
+
+      const pointer = drag.axis === 'column' ? moveEvent.clientX : moveEvent.clientY;
+      const delta = pointer - drag.startPointer;
+      const pairSize = drag.startBeforePx + drag.startAfterPx;
+      const requestedMinSize = drag.axis === 'column' ? MIN_COLUMN_SIZE_PX : MIN_ROW_SIZE_PX;
+      const minSize = Math.min(requestedMinSize, Math.max(1, pairSize / 2 - 1));
+      const rawBeforePx = drag.startBeforePx + delta;
+      const beforePx = Math.max(minSize, Math.min(pairSize - minSize, rawBeforePx));
+      const afterPx = pairSize - beforePx;
+
+      if (drag.axis === 'column') {
+        setColumnFractions((current) => {
+          const normalized = normalizeFractions(current, gridLayout.columns);
+          if (drag.boundaryIndex >= normalized.length - 1) return normalized;
+
+          const next = [...normalized];
+          next[drag.boundaryIndex] = beforePx / drag.containerSize;
+          next[drag.boundaryIndex + 1] = afterPx / drag.containerSize;
+          return next;
+        });
+        return;
+      }
+
+      setRowFractions((current) => {
+        const normalized = normalizeFractions(current, gridLayout.rows);
+        if (drag.boundaryIndex >= normalized.length - 1) return normalized;
+
+        const next = [...normalized];
+        next[drag.boundaryIndex] = beforePx / drag.containerSize;
+        next[drag.boundaryIndex + 1] = afterPx / drag.containerSize;
+        return next;
+      });
+    };
+
+    const onPointerUp = () => {
+      resizeDragRef.current = null;
+      clearResizeListeners();
+    };
+
+    resizeMoveListenerRef.current = onPointerMove;
+    resizeUpListenerRef.current = onPointerUp;
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    event.preventDefault();
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -754,57 +1033,190 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
       {!isGridEnabled ? <div className="min-h-0 flex-1 overflow-hidden">{singleView}</div> : null}
 
       {isGridEnabled ? (
-        <div className="min-h-0 flex-1 overflow-auto p-4">
+        <div className="min-h-0 flex flex-1 flex-col overflow-hidden">
           <div
+            ref={gridSurfaceRef}
             className={cn(
-              'grid gap-4',
-              GRID_COLUMNS_CLASS[slotCount],
-              isTwoSlotExpanded && 'h-full auto-rows-fr'
+              'relative min-h-0 flex-1 w-full overflow-hidden bg-background',
+              pageCount > 1 ? '' : 'border-b border-border'
             )}
           >
-            {Array.from({ length: displayCount }).map((_, index) => {
-              const item = orderedItems[index] || null;
+            <div
+              className="grid h-full w-full overflow-hidden"
+              style={{
+                gridTemplateColumns: normalizedColumnFractions
+                  .map((value) => `${value}fr`)
+                  .join(' '),
+                gridTemplateRows: normalizedRowFractions.map((value) => `${value}fr`).join(' '),
+              }}
+            >
+              {Array.from({ length: displayCount }).map((_, index) => {
+                const item = pagedItems[index] || null;
 
-              if (!item) {
                 return (
-                  <EmptySlotCard
-                    key={`slot-empty-${index}`}
-                    slotIndex={index}
-                    tileHeightClass={tileHeightClass}
-                    isDropTarget={draggedItemKey !== null && dragOverIndex === index}
-                    onCreateTaskInSlot={handleCreateTaskInSlot}
-                    onDragOverSlot={handleDragOverSlot}
-                    onDropSlot={handleDropSlot}
-                  />
+                  <div
+                    key={item?.key || `slot-empty-${index}`}
+                    className="min-h-0 min-w-0 overflow-hidden"
+                  >
+                    {item ? (
+                      <TaskTerminalTile
+                        item={item}
+                        active={
+                          activeTask?.id === item.task.id &&
+                          activeTask?.projectId === item.project.id
+                        }
+                        isDropTarget={draggedItemKey !== null && dragOverIndex === index}
+                        showProjectBadge={showProjectBadge}
+                        onSelectTaskInProject={onSelectTaskInProject}
+                        onOpenTaskInProject={onOpenTaskInProject}
+                        onDragHandleStart={setDraggedItemKey}
+                        onDragHandleEnd={() => {
+                          setDraggedItemKey(null);
+                          setDragOverIndex(null);
+                        }}
+                        onDragOverSlot={handleDragOverSlot}
+                        onDropSlot={handleDropSlot}
+                        slotIndex={index}
+                      />
+                    ) : (
+                      <EmptySlotCard
+                        slotIndex={index}
+                        isDropTarget={draggedItemKey !== null && dragOverIndex === index}
+                        onCreateTaskInSlot={handleCreateTaskInSlot}
+                        onDragOverSlot={handleDragOverSlot}
+                        onDropSlot={handleDropSlot}
+                      />
+                    )}
+                  </div>
                 );
-              }
+              })}
+            </div>
 
-              return (
-                <TaskTerminalTile
-                  key={item.key}
-                  item={item}
-                  active={activeTask?.id === item.task.id && activeTask?.projectId === item.project.id}
-                  isDropTarget={draggedItemKey !== null && dragOverIndex === index}
-                  tileHeightClass={tileHeightClass}
-                  showProjectBadge={showProjectBadge}
-                  onSelectTaskInProject={onSelectTaskInProject}
-                  onOpenTaskInProject={onOpenTaskInProject}
-                  onDragHandleStart={setDraggedItemKey}
-                  onDragHandleEnd={() => {
-                    setDraggedItemKey(null);
-                    setDragOverIndex(null);
-                  }}
-                  onDragOverSlot={handleDragOverSlot}
-                  onDropSlot={handleDropSlot}
-                  slotIndex={index}
-                />
-              );
-            })}
+            {columnBoundaryPercents.map((leftPercent, boundaryIndex) => (
+              <div
+                key={`col-resize-${boundaryIndex}`}
+                className="absolute inset-y-0 z-20 -translate-x-1/2 cursor-col-resize touch-none"
+                style={{ left: `${leftPercent}%`, width: `${RESIZE_HANDLE_SIZE_PX}px` }}
+                onPointerDown={(event) => startResize('column', boundaryIndex, event)}
+                title="Drag to resize columns"
+                aria-label="Resize columns"
+                role="separator"
+                aria-orientation="vertical"
+              >
+                <div className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border/90" />
+              </div>
+            ))}
+
+            {rowBoundaryPercents.map((topPercent, boundaryIndex) => (
+              <div
+                key={`row-resize-${boundaryIndex}`}
+                className="absolute inset-x-0 z-20 -translate-y-1/2 cursor-row-resize touch-none"
+                style={{ top: `${topPercent}%`, height: `${RESIZE_HANDLE_SIZE_PX}px` }}
+                onPointerDown={(event) => startResize('row', boundaryIndex, event)}
+                title="Drag to resize rows"
+                aria-label="Resize rows"
+                role="separator"
+                aria-orientation="horizontal"
+              >
+                <div className="pointer-events-none absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-border/90" />
+              </div>
+            ))}
           </div>
+
+          {pageCount > 1 ? (
+            <div className="flex items-center justify-between border-t border-border bg-muted/20 px-3 py-2">
+              <div className="text-xs text-muted-foreground">
+                Showing {visibleStart}-{visibleEnd} of {orderedItems.length}
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setPageIndex((current) => Math.max(0, current - 1))}
+                  disabled={pageIndex === 0}
+                  className={cn(
+                    'inline-flex h-7 w-7 items-center justify-center rounded border border-border bg-background text-muted-foreground transition-colors',
+                    pageIndex === 0
+                      ? 'cursor-not-allowed opacity-40'
+                      : 'hover:bg-muted hover:text-foreground'
+                  )}
+                  aria-label="Previous grid page"
+                  title="Previous page"
+                >
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                </button>
+
+                {visiblePageIndexes[0] > 0 ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setPageIndex(0)}
+                      className="inline-flex h-7 min-w-7 items-center justify-center rounded border border-border bg-background px-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    >
+                      1
+                    </button>
+                    {visiblePageIndexes[0] > 1 ? (
+                      <span className="px-1 text-xs text-muted-foreground">...</span>
+                    ) : null}
+                  </>
+                ) : null}
+
+                {visiblePageIndexes.map((index) => (
+                  <button
+                    key={`grid-page-${index}`}
+                    type="button"
+                    onClick={() => setPageIndex(index)}
+                    className={cn(
+                      'inline-flex h-7 min-w-7 items-center justify-center rounded border px-2 text-xs transition-colors',
+                      pageIndex === index
+                        ? 'border-primary bg-primary text-primary-foreground'
+                        : 'border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground'
+                    )}
+                    aria-label={`Go to grid page ${index + 1}`}
+                  >
+                    {index + 1}
+                  </button>
+                ))}
+
+                {visiblePageIndexes[visiblePageIndexes.length - 1] < pageCount - 1 ? (
+                  <>
+                    {visiblePageIndexes[visiblePageIndexes.length - 1] < pageCount - 2 ? (
+                      <span className="px-1 text-xs text-muted-foreground">...</span>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => setPageIndex(pageCount - 1)}
+                      className="inline-flex h-7 min-w-7 items-center justify-center rounded border border-border bg-background px-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    >
+                      {pageCount}
+                    </button>
+                  </>
+                ) : null}
+
+                <button
+                  type="button"
+                  onClick={() => setPageIndex((current) => Math.min(pageCount - 1, current + 1))}
+                  disabled={pageIndex >= pageCount - 1}
+                  className={cn(
+                    'inline-flex h-7 w-7 items-center justify-center rounded border border-border bg-background text-muted-foreground transition-colors',
+                    pageIndex >= pageCount - 1
+                      ? 'cursor-not-allowed opacity-40'
+                      : 'hover:bg-muted hover:text-foreground'
+                  )}
+                  aria-label="Next grid page"
+                  title="Next page"
+                >
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
-      <Dialog open={projectPickerSlotIndex !== null} onOpenChange={(open) => !open && setProjectPickerSlotIndex(null)}>
+      <Dialog
+        open={projectPickerSlotIndex !== null}
+        onOpenChange={(open) => !open && setProjectPickerSlotIndex(null)}
+      >
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Create Task In Project</DialogTitle>
@@ -823,7 +1235,9 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
                   triggerCreateTask(projectItem, slotIndex);
                 }}
               >
-                <div className="truncate text-sm font-medium text-foreground">{projectItem.name}</div>
+                <div className="truncate text-sm font-medium text-foreground">
+                  {projectItem.name}
+                </div>
                 <div className="truncate text-xs text-muted-foreground">{projectItem.path}</div>
               </button>
             ))}

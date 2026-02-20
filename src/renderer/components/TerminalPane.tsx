@@ -10,7 +10,16 @@ import React, {
 import { terminalSessionRegistry } from '../terminal/SessionRegistry';
 import type { SessionTheme } from '../terminal/TerminalSessionManager';
 import { log } from '../lib/logger';
+import { extractDroppedFilePaths } from '../lib/dndFilePaths';
 import ExternalLinkModal from './ExternalLinkModal';
+
+const escapeShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+
+const sendEscapedPathsToPty = (ptyId: string, paths: string[]) => {
+  if (paths.length === 0) return;
+  const escaped = paths.map((path) => escapeShellArg(path)).join(' ');
+  window.electronAPI.ptyInput({ id: ptyId, data: `${escaped} ` });
+};
 
 type Props = {
   id: string;
@@ -211,13 +220,10 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
       try {
         event.preventDefault();
         const dt = event.dataTransfer;
-        if (!dt || !dt.files || dt.files.length === 0) return;
-        const paths: string[] = [];
-        for (let i = 0; i < dt.files.length; i++) {
-          const file = dt.files[i] as any;
-          const p: string | undefined = file?.path;
-          if (p) paths.push(p);
-        }
+        if (!dt) return;
+        const paths = extractDroppedFilePaths(dt, (file) =>
+          window.electronAPI.resolveFilePath?.(file)
+        );
         if (paths.length === 0) return;
 
         if (remote?.connectionId) {
@@ -228,18 +234,17 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
               localPaths: paths,
             });
             if (result.success && result.remotePaths) {
-              const escaped = result.remotePaths
-                .map((p) => `'${p.replace(/'/g, "'\\''")}'`)
-                .join(' ');
-              window.electronAPI.ptyInput({ id, data: `${escaped} ` });
+              const remotePaths = result.remotePaths.filter((path): path is string =>
+                Boolean(path)
+              );
+              sendEscapedPathsToPty(id, remotePaths);
             }
           } catch (error) {
             log.warn('SSH file transfer failed', { error });
           }
         } else {
           // Local terminal: send local path directly
-          const escaped = paths.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ');
-          window.electronAPI.ptyInput({ id, data: `${escaped} ` });
+          sendEscapedPathsToPty(id, paths);
         }
         sessionRef.current?.focus();
       } catch (error) {
