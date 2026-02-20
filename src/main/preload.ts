@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { TerminalSnapshotPayload } from './types/terminalSnapshot';
 import type { OpenInAppId } from '../shared/openInApps';
 
@@ -106,6 +106,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   ptyScpToRemote: (args: { connectionId: string; localPaths: string[] }) =>
     ipcRenderer.invoke('pty:scp-to-remote', args),
+  resolveFilePath: (file: Parameters<typeof webUtils.getPathForFile>[0]) => {
+    try {
+      const path = webUtils.getPathForFile(file);
+      return typeof path === 'string' && path ? path : null;
+    } catch {
+      return null;
+    }
+  },
 
   onPtyData: (id: string, listener: (data: string) => void) => {
     const channel = `pty:data:${id}`;
@@ -291,8 +299,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     taskPath: string;
     filePath: string;
     scope?: 'all' | 'staged' | 'unstaged';
-  }) =>
-    ipcRenderer.invoke('git:get-file-diff', args),
+  }) => ipcRenderer.invoke('git:get-file-diff', args),
   stageFile: (args: { taskPath: string; filePath: string }) =>
     ipcRenderer.invoke('git:stage-file', args),
   stageAllFiles: (args: { taskPath: string }) => ipcRenderer.invoke('git:stage-all-files', args),

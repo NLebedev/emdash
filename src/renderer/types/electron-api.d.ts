@@ -339,6 +339,7 @@ declare global {
         remotePaths?: string[];
         error?: string;
       }>;
+      resolveFilePath: (file: File) => string | null;
       ptyInput: (args: { id: string; data: string }) => void;
       ptyResize: (args: { id: string; cols: number; rows?: number }) => void;
       ptyKill: (id: string) => void;
@@ -1353,6 +1354,7 @@ export interface ElectronAPI {
     remotePaths?: string[];
     error?: string;
   }>;
+  resolveFilePath: (file: File) => string | null;
   ptyInput: (args: { id: string; data: string }) => void;
   ptyResize: (args: { id: string; cols: number; rows?: number }) => void;
   ptyKill: (id: string) => void;
