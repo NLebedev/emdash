@@ -24,6 +24,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "type-check": "tsc --noEmit",
+    "test:e2e:diff-smoke": "pnpm run build && playwright test e2e/diff-smoke.spec.ts",
     "docs": "cd docs && pnpm run dev",
     "docs:build": "cd docs && pnpm run build"
   },
@@ -48,6 +49,7 @@
     "@types/react": "^18.2.45",
     "@types/react-dom": "^18.2.18",
     "@types/react-syntax-highlighter": "^15.5.13",
+    "@playwright/test": "^1.56.1",
     "@typescript-eslint/eslint-plugin": "^6.14.0",
     "@typescript-eslint/parser": "^6.14.0",
     "@vitejs/plugin-react": "^4.7.0",

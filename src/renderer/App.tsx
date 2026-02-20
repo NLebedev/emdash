@@ -19,6 +19,7 @@ import Titlebar from './components/titlebar/Titlebar';
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from './components/ui/resizable';
 import { RightSidebarProvider, useRightSidebar } from './components/ui/right-sidebar';
 import { SidebarProvider } from './components/ui/sidebar';
+import DiffSmokeHarness from './components/e2e/DiffSmokeHarness';
 import { KeyboardSettingsProvider } from './contexts/KeyboardSettingsContext';
 import { ToastAction } from './components/ui/toast';
 import { Toaster } from './components/ui/toaster';
@@ -754,10 +755,13 @@ const AppContent: React.FC = () => {
 };
 
 const App: React.FC = () => {
+  const isDiffSmokeRoute =
+    typeof window !== 'undefined' && window.location.hash.startsWith('#/e2e/diff-smoke');
+
   return (
     <ThemeProvider>
       <ErrorBoundary>
-        <AppContent />
+        {isDiffSmokeRoute ? <DiffSmokeHarness /> : <AppContent />}
       </ErrorBoundary>
     </ThemeProvider>
   );

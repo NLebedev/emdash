@@ -45,6 +45,17 @@ interface ChangesDiffModalProps {
   initialSection?: 'staged' | 'unstaged';
   onRefreshChanges?: () => Promise<void> | void;
   onToggleView?: () => void;
+  electronAPI?: Pick<
+    Window['electronAPI'],
+    | 'fsReadImage'
+    | 'getFileDiff'
+    | 'fsRead'
+    | 'stageDiffRange'
+    | 'unstageDiffRange'
+    | 'fsWriteFile'
+    | 'stageFile'
+    | 'unstageFile'
+  >;
 }
 
 type DiffSection = 'staged' | 'unstaged';
@@ -220,7 +231,9 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
   initialSection,
   onRefreshChanges,
   onToggleView,
+  electronAPI,
 }) => {
+  const gitApi = electronAPI ?? window.electronAPI;
   const { taskId: scopedTaskId, taskPath: scopedTaskPath } = useTaskScope();
   const resolvedTaskId = taskId ?? scopedTaskId;
   const resolvedTaskPath = taskPath ?? scopedTaskPath;
@@ -389,7 +402,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
           }
 
           try {
-            const imageRes = await window.electronAPI.fsReadImage(safeTaskPath, filePath);
+            const imageRes = await gitApi.fsReadImage(safeTaskPath, filePath);
             if (cancelled) return;
 
             if (imageRes?.success && imageRes.dataUrl) {
@@ -467,7 +480,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
 
         // Get diff lines
         if (!safeTaskPath) return;
-        const diffRes = await window.electronAPI.getFileDiff({
+        const diffRes = await gitApi.getFileDiff({
           taskPath: safeTaskPath,
           filePath,
           scope: diffScope,
@@ -492,7 +505,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
 
           // For unstaged view, prefer current file content when available.
           if (diffScope === 'unstaged') {
-            const readRes = await window.electronAPI.fsRead(
+            const readRes = await gitApi.fsRead(
               safeTaskPath,
               filePath,
               2 * 1024 * 1024
@@ -510,7 +523,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
           // For unstaged view, prefer actual current content for better accuracy.
           if (diffScope === 'unstaged') {
             try {
-              const readRes = await window.electronAPI.fsRead(
+              const readRes = await gitApi.fsRead(
                 safeTaskPath,
                 filePath,
                 2 * 1024 * 1024
@@ -1126,7 +1139,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
         setIsStagingRange(true);
         try {
           if (selectedBlockAction === 'stage') {
-            const result = await window.electronAPI.stageDiffRange({
+            const result = await gitApi.stageDiffRange({
               taskPath: safeTaskPath,
               filePath: selected,
               startLine: lineNumber,
@@ -1145,7 +1158,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
               return;
             }
           } else {
-            const result = await window.electronAPI.unstageDiffRange({
+            const result = await gitApi.unstageDiffRange({
               taskPath: safeTaskPath,
               filePath: selected,
               startLine: lineNumber,
@@ -1252,7 +1265,7 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
     setIsSaving(true);
     setSaveError(null);
     try {
-      const res = await window.electronAPI.fsWriteFile(safeTaskPath, selected, modifiedDraft, true);
+      const res = await gitApi.fsWriteFile(safeTaskPath, selected, modifiedDraft, true);
       if (!res?.success) {
         throw new Error(res?.error || 'Failed to save file');
       }
@@ -1313,8 +1326,8 @@ export const ChangesDiffModal: React.FC<ChangesDiffModalProps> = ({
     try {
       const result =
         action === 'stage'
-          ? await window.electronAPI.stageFile({ taskPath: safeTaskPath, filePath })
-          : await window.electronAPI.unstageFile({ taskPath: safeTaskPath, filePath });
+          ? await gitApi.stageFile({ taskPath: safeTaskPath, filePath })
+          : await gitApi.unstageFile({ taskPath: safeTaskPath, filePath });
 
       if (!result?.success) {
         throw new Error(
