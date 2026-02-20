@@ -1,7 +1,7 @@
 ---
 default_branch: main
 package_manager: pnpm
-node_version: "22.20.0"
+node_version: "24.2.0"
 start_command: "pnpm run d"
 dev_command: "pnpm run dev"
 build_command: "pnpm run build"
@@ -21,7 +21,7 @@ optional_env:
 ---
 
 **Quickstart**
-1. `nvm use` (installs Node 22.20.0 if missing) or install Node 22.x manually.
+1. `nvm use` (installs Node 24.2.0 if missing) or install Node 24.x manually.
 2. `pnpm run d` to install dependencies, rebuild native modules, and launch Electron + Vite.
 3. If `pnpm run d` fails mid-stream, rerun `pnpm install`, then `pnpm run dev` (main + renderer).
 

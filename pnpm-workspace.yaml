@@ -1,5 +1,5 @@
 packages:
-  - '.'
+  - .
 
 onlyBuiltDependencies:
   - better-sqlite3
@@ -10,3 +10,5 @@ onlyBuiltDependencies:
   - node-pty
   - protobufjs
   - sqlite3
+
+storeDir: .pnpm-store/v10

@@ -153,7 +153,7 @@ if (process.platform === 'darwin' && !app.isPackaged) {
     'icon-dock.png'
   );
   try {
-    app.dock.setIcon(iconPath);
+    app.dock?.setIcon(iconPath);
   } catch (err) {
     console.warn('Failed to set dock icon:', err);
   }
