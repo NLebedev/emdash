@@ -50,6 +50,10 @@ class SessionRegistry {
     return this.sessions.get(taskId);
   }
 
+  forceResizeSync(taskId: string) {
+    this.sessions.get(taskId)?.forceResizeSync();
+  }
+
   disposeAll() {
     for (const id of Array.from(this.sessions.keys())) {
       this.dispose(id);

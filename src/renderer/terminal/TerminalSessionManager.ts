@@ -88,6 +88,8 @@ export class TerminalSessionManager {
   private customFontFamily = '';
   private themeFontFamily = '';
   private pendingFitFrame: number | null = null;
+  private deferredFitTimers: ReturnType<typeof setTimeout>[] = [];
+  private deferredResizeSyncTimers: ReturnType<typeof setTimeout>[] = [];
   private pendingResizeTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingResize: { cols: number; rows: number } | null = null;
   private lastSentResize: { cols: number; rows: number } | null = null;
@@ -319,6 +321,8 @@ export class TerminalSessionManager {
     }
 
     this.scheduleFit();
+    this.scheduleDeferredFits();
+    this.scheduleDeferredResizeSyncs();
 
     this.resizeObserver = new ResizeObserver(() => {
       this.scheduleFit();
@@ -348,6 +352,8 @@ export class TerminalSessionManager {
       // Capture viewport position before detaching
       this.captureViewportPosition();
       this.cancelScheduledFit();
+      this.cancelDeferredFits();
+      this.cancelDeferredResizeSyncs();
       this.clearQueuedResize();
       this.resizeObserver?.disconnect();
       this.resizeObserver = null;
@@ -371,6 +377,8 @@ export class TerminalSessionManager {
     this.detach();
     this.stopSnapshotTimer();
     this.cancelScheduledFit();
+    this.cancelDeferredFits();
+    this.cancelDeferredResizeSyncs();
     this.clearQueuedResize();
     // Only capture final snapshot if snapshots are enabled
     if (!this.options.disableSnapshots) {
@@ -447,6 +455,40 @@ export class TerminalSessionManager {
     return () => {
       this.exitListeners.delete(listener);
     };
+  }
+
+  /**
+   * Force a PTY resize pulse for clients that need an explicit SIGWINCH
+   * after layout transitions (for example switching grid -> single view).
+   */
+  forceResizeSync() {
+    if (this.disposed) return;
+    const proposed = this.fitAddon.proposeDimensions();
+    if (proposed?.cols && proposed?.rows) {
+      const nextCols = Math.max(MIN_TERMINAL_COLS, Math.floor(proposed.cols));
+      const nextRows = Math.max(MIN_TERMINAL_ROWS, Math.floor(proposed.rows));
+      if (this.terminal.cols !== nextCols || this.terminal.rows !== nextRows) {
+        this.terminal.resize(nextCols, nextRows);
+      }
+    } else {
+      // If dimensions are not yet measurable, keep retrying through normal fit scheduling.
+      this.fitPreservingViewport();
+      this.scheduleFit();
+    }
+
+    if (!this.ptyStarted) return;
+
+    const cols = Math.max(MIN_TERMINAL_COLS, this.terminal.cols);
+    const rows = Math.max(MIN_TERMINAL_ROWS, this.terminal.rows);
+    const pulseCols = cols > MIN_TERMINAL_COLS ? cols - 1 : cols + 1;
+
+    try {
+      window.electronAPI.ptyResize({ id: this.id, cols: pulseCols, rows });
+      window.electronAPI.ptyResize({ id: this.id, cols, rows });
+      this.lastSentResize = { cols, rows };
+    } catch (error) {
+      log.warn('Forced terminal resize sync failed', { id: this.id, error });
+    }
   }
 
   private handleTerminalInput(data: string, isNewlineInsert: boolean = false) {
@@ -590,6 +632,45 @@ export class TerminalSessionManager {
       cancelAnimationFrame(this.pendingFitFrame);
       this.pendingFitFrame = null;
     }
+  }
+
+  private scheduleDeferredFits() {
+    this.cancelDeferredFits();
+    const delays = [80, 220, 420];
+    for (const delay of delays) {
+      const timer = setTimeout(() => {
+        if (this.disposed || !this.attachedContainer) return;
+        this.scheduleFit();
+      }, delay);
+      this.deferredFitTimers.push(timer);
+    }
+  }
+
+  private cancelDeferredFits() {
+    for (const timer of this.deferredFitTimers) {
+      clearTimeout(timer);
+    }
+    this.deferredFitTimers = [];
+  }
+
+  private scheduleDeferredResizeSyncs() {
+    this.cancelDeferredResizeSyncs();
+    const delays = [40, 120, 240, 420, 720];
+    for (const delay of delays) {
+      const timer = setTimeout(() => {
+        if (this.disposed || !this.attachedContainer) return;
+        this.fitPreservingViewport();
+        this.forceResizeSync();
+      }, delay);
+      this.deferredResizeSyncTimers.push(timer);
+    }
+  }
+
+  private cancelDeferredResizeSyncs() {
+    for (const timer of this.deferredResizeSyncTimers) {
+      clearTimeout(timer);
+    }
+    this.deferredResizeSyncTimers = [];
   }
 
   private normalizeSize(cols: number, rows: number): { cols: number; rows: number } | null {
@@ -1022,6 +1103,6 @@ export class TerminalSessionManager {
 
   private sendSizeIfStarted() {
     if (!this.ptyStarted || this.disposed) return;
-    this.queuePtyResize(this.terminal.cols, this.terminal.rows, true);
+    this.forceResizeSync();
   }
 }

@@ -43,6 +43,7 @@ interface Props {
   defaultBranch?: string | null;
   className?: string;
   initialAgent?: Agent;
+  fullWidth?: boolean;
 }
 
 const ChatInterface: React.FC<Props> = ({
@@ -54,6 +55,7 @@ const ChatInterface: React.FC<Props> = ({
   defaultBranch,
   className,
   initialAgent,
+  fullWidth = false,
 }) => {
   const { effectiveTheme } = useTheme();
   const { toast } = useToast();
@@ -833,6 +835,25 @@ const ChatInterface: React.FC<Props> = ({
     } catch {}
   }, [agent, task.id]);
 
+  useEffect(() => {
+    if (!fullWidth || !conversationsLoaded) return;
+
+    terminalSessionRegistry.forceResizeSync(terminalId);
+
+    const delays = [80, 180, 360, 600, 900];
+    const timers = delays.map((delay) =>
+      setTimeout(() => {
+        terminalSessionRegistry.forceResizeSync(terminalId);
+      }, delay)
+    );
+
+    return () => {
+      for (const timer of timers) clearTimeout(timer);
+    };
+  }, [fullWidth, conversationsLoaded, terminalId]);
+
+  const contentWidthClass = fullWidth ? 'w-full max-w-none' : 'mx-auto max-w-4xl';
+
   if (!isTerminal) {
     return null;
   }
@@ -861,7 +882,7 @@ const ChatInterface: React.FC<Props> = ({
 
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="px-6 pt-4">
-            <div className="mx-auto max-w-4xl space-y-2">
+            <div className={cn(contentWidthClass, 'space-y-2')}>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   {sortedConversations.map((conv, index) => {
@@ -997,7 +1018,7 @@ const ChatInterface: React.FC<Props> = ({
           </div>
           <div className="mt-4 min-h-0 flex-1 px-6">
             <div
-              className={`mx-auto h-full max-w-4xl overflow-hidden rounded-md ${
+              className={`${contentWidthClass} h-full overflow-hidden rounded-md ${
                 agent === 'charm'
                   ? effectiveTheme === 'dark-black'
                     ? 'bg-black'
@@ -1106,7 +1127,7 @@ const ChatInterface: React.FC<Props> = ({
           </div>
           {projectPath && (
             <div className="px-6 pb-2 pt-2">
-              <div className="mx-auto max-w-4xl">
+              <div className={contentWidthClass}>
                 <QuickActions projectPath={projectPath} terminalId={terminalId} />
               </div>
             </div>
