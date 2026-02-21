@@ -12,6 +12,12 @@ function appendHash(url: string, hashPath?: string | null): string {
   return `${url}#${hashPath}`;
 }
 
+function resolveDevRendererUrl(): string {
+  const parsed = Number(process.env.EMDASH_DEV_PORT || 3000);
+  const port = Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : 3000;
+  return `http://localhost:${port}`;
+}
+
 export function createMainWindow(): BrowserWindow {
   // In development, resolve icon from src/assets
   // In production (packaged), electron-builder handles the icon
@@ -43,7 +49,7 @@ export function createMainWindow(): BrowserWindow {
   const e2eHashPath = process.argv.includes('--e2e-diff-smoke') ? E2E_DIFF_SMOKE_HASH : null;
 
   if (isDev) {
-    mainWindow.loadURL(appendHash('http://localhost:3000', e2eHashPath));
+    mainWindow.loadURL(appendHash(resolveDevRendererUrl(), e2eHashPath));
   } else {
     // Serve renderer over an HTTP origin in production so embeds work.
     const rendererRoot = join(__dirname, '..', '..', '..', 'renderer');

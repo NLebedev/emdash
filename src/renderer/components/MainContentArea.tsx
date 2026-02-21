@@ -145,6 +145,7 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
           defaultBranch={projectDefaultBranch}
           className="min-h-0 flex-1"
           initialAgent={activeTaskAgent || undefined}
+          fullWidth={!showTaskGrid}
         />
       )
     ) : (

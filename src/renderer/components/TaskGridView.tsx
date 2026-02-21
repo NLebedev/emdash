@@ -1,10 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUpRight, ChevronLeft, ChevronRight, GripVertical, Layers, Plus } from 'lucide-react';
 import { makePtyId } from '@shared/ptyId';
 import { getTaskEnvVars } from '@shared/task/envVars';
 import { PROVIDER_IDS, type ProviderId } from '@shared/providers/registry';
 import { TerminalPane } from './TerminalPane';
 import AgentLogo from './AgentLogo';
+import { CreateChatModal } from './CreateChatModal';
 import { Button } from './ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog';
 import { Spinner } from './ui/spinner';
@@ -15,6 +16,7 @@ import { agentConfig } from '../lib/agentConfig';
 import { extractDroppedFilePaths, hasFilesInDataTransfer } from '../lib/dndFilePaths';
 import { agentMeta } from '../providers/meta';
 import type { Project, Task } from '../types/app';
+import { type Conversation } from '../../main/services/DatabaseService';
 
 const CONVERSATIONS_CHANGED_EVENT = 'emdash:conversations-changed';
 const GRID_SLOT_OPTIONS = [2, 4, 6, 9] as const;
@@ -143,35 +145,50 @@ const buildMainTarget = (taskId: string, provider: ProviderId): TerminalTarget =
   provider,
 });
 
-async function resolveTerminalTarget(
+const sortConversations = (conversations: Conversation[]): Conversation[] => {
+  return [...conversations].sort((left, right) => {
+    if (left.displayOrder !== undefined && right.displayOrder !== undefined) {
+      return left.displayOrder - right.displayOrder;
+    }
+    return new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime();
+  });
+};
+
+const resolveConversationProvider = (
+  conversation: Pick<Conversation, 'provider'> | null | undefined,
+  fallbackProvider: ProviderId
+): ProviderId => {
+  return isProviderId(conversation?.provider) ? conversation.provider : fallbackProvider;
+};
+
+const buildTargetFromConversation = (
   taskId: string,
-  taskAgentId?: string
-): Promise<TerminalTarget> {
-  const fallbackProvider = resolveStoredProvider(taskId, taskAgentId);
-
-  try {
-    const response = await window.electronAPI.getActiveConversation(taskId);
-    const activeConversation = response?.success ? response.conversation : null;
-    if (!activeConversation) {
-      return buildMainTarget(taskId, fallbackProvider);
-    }
-
-    const provider = isProviderId(activeConversation.provider)
-      ? activeConversation.provider
-      : fallbackProvider;
-
-    if (!activeConversation.isMain && activeConversation.id) {
-      return {
-        id: makePtyId(provider, 'chat', String(activeConversation.id)),
-        provider,
-      };
-    }
-
-    return buildMainTarget(taskId, provider);
-  } catch {
-    return buildMainTarget(taskId, fallbackProvider);
+  fallbackProvider: ProviderId,
+  conversation: Conversation | null | undefined
+): TerminalTarget => {
+  const provider = resolveConversationProvider(conversation, fallbackProvider);
+  if (conversation && !conversation.isMain && conversation.id) {
+    return {
+      id: makePtyId(provider, 'chat', String(conversation.id)),
+      provider,
+    };
   }
-}
+  return buildMainTarget(taskId, provider);
+};
+
+const loadConversationsForTask = async (taskId: string): Promise<Conversation[]> => {
+  const result = await window.electronAPI.getConversations(taskId);
+  if (result?.success && Array.isArray(result.conversations) && result.conversations.length > 0) {
+    return sortConversations(result.conversations as Conversation[]);
+  }
+
+  const defaultResult = await window.electronAPI.getOrCreateDefaultConversation(taskId);
+  if (defaultResult?.success && defaultResult.conversation) {
+    return [defaultResult.conversation as Conversation];
+  }
+
+  return [];
+};
 
 const loadGridScopeProjectId = (): string | null => {
   try {
@@ -274,6 +291,7 @@ interface TaskTerminalTileProps {
   active: boolean;
   isDropTarget: boolean;
   showProjectBadge: boolean;
+  installedAgents: string[];
   onSelectTaskInProject: (project: Project, task: Task) => void;
   onOpenTaskInProject: (project: Project, task: Task) => void;
   onDragHandleStart: (itemKey: string) => void;
@@ -288,6 +306,7 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
   active,
   isDropTarget,
   showProjectBadge,
+  installedAgents,
   onSelectTaskInProject,
   onOpenTaskInProject,
   onDragHandleStart,
@@ -299,11 +318,19 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
   const { effectiveTheme } = useTheme();
   const busy = useTaskBusy(item.task.id);
   const [target, setTarget] = useState<TerminalTarget | null>(null);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [showCreateChatModal, setShowCreateChatModal] = useState(false);
   const [needsAttention, setNeedsAttention] = useState(false);
   const taskId = item.task.id;
   const taskAgentId = item.task.agentId;
   const prevBusyRef = useRef<boolean>(busy);
   const busySinceClearRef = useRef<boolean>(busy);
+  const fallbackProvider = useMemo(
+    () => resolveStoredProvider(taskId, taskAgentId),
+    [taskId, taskAgentId]
+  );
+  const sortedConversations = useMemo(() => sortConversations(conversations), [conversations]);
 
   const taskEnv = useMemo(() => {
     return getTaskEnvVars({
@@ -315,13 +342,61 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
     });
   }, [item.task.id, item.task.name, item.task.path, item.projectPath, item.defaultBranch]);
 
+  const applyConversations = useCallback(
+    async (rawConversations: Conversation[]) => {
+      const sorted = sortConversations(rawConversations);
+      const nextActiveConversation =
+        sorted.find((conversation) => conversation.isActive) ?? sorted[0] ?? null;
+
+      if (nextActiveConversation && !nextActiveConversation.isActive) {
+        try {
+          await window.electronAPI.setActiveConversation({
+            taskId,
+            conversationId: nextActiveConversation.id,
+          });
+        } catch {
+          // Ignore best-effort active conversation sync failures.
+        }
+      }
+
+      setConversations(
+        nextActiveConversation
+          ? sorted.map((conversation) => ({
+              ...conversation,
+              isActive: conversation.id === nextActiveConversation.id,
+            }))
+          : sorted
+      );
+      setActiveConversationId(nextActiveConversation?.id ?? null);
+      setTarget(buildTargetFromConversation(taskId, fallbackProvider, nextActiveConversation));
+    },
+    [fallbackProvider, taskId]
+  );
+
+  const reloadConversations = useCallback(async () => {
+    try {
+      const loadedConversations = await loadConversationsForTask(taskId);
+      await applyConversations(loadedConversations);
+    } catch {
+      setConversations([]);
+      setActiveConversationId(null);
+      setTarget(buildMainTarget(taskId, fallbackProvider));
+    }
+  }, [applyConversations, fallbackProvider, taskId]);
+
   useEffect(() => {
     let cancelled = false;
 
     const load = async () => {
-      const resolved = await resolveTerminalTarget(taskId, taskAgentId);
-      if (!cancelled) {
-        setTarget(resolved);
+      try {
+        const loadedConversations = await loadConversationsForTask(taskId);
+        if (cancelled) return;
+        await applyConversations(loadedConversations);
+      } catch {
+        if (cancelled) return;
+        setConversations([]);
+        setActiveConversationId(null);
+        setTarget(buildMainTarget(taskId, fallbackProvider));
       }
     };
 
@@ -340,7 +415,7 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
       cancelled = true;
       window.removeEventListener(CONVERSATIONS_CHANGED_EVENT, handleConversationsChanged);
     };
-  }, [taskId, taskAgentId]);
+  }, [applyConversations, fallbackProvider, taskId]);
 
   useEffect(() => {
     if (busy) {
@@ -359,11 +434,93 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
     busySinceClearRef.current = busy;
   };
 
-  const provider = target?.provider ?? resolveStoredProvider(taskId, taskAgentId);
+  useEffect(() => {
+    if (!target?.provider) return;
+    try {
+      localStorage.setItem(`taskAgent:${taskId}`, target.provider);
+    } catch {
+      // Ignore localStorage failures.
+    }
+  }, [taskId, target?.provider]);
+
+  const handleSwitchConversation = async (conversationId: string) => {
+    if (!conversationId || conversationId === activeConversationId) return;
+
+    const selectedConversation = sortedConversations.find(
+      (conversation) => conversation.id === conversationId
+    );
+    if (!selectedConversation) return;
+
+    try {
+      await window.electronAPI.setActiveConversation({ taskId, conversationId });
+    } catch {
+      // Ignore DB sync failures and still switch locally.
+    }
+
+    setActiveConversationId(conversationId);
+    setConversations((current) =>
+      current.map((conversation) => ({
+        ...conversation,
+        isActive: conversation.id === conversationId,
+      }))
+    );
+    setTarget(buildTargetFromConversation(taskId, fallbackProvider, selectedConversation));
+  };
+
+  const handleCreateChat = async (title: string, newAgent: string) => {
+    try {
+      const result = await window.electronAPI.createConversation({
+        taskId,
+        title,
+        provider: newAgent,
+      });
+      if (!result?.success) return;
+
+      await reloadConversations();
+      try {
+        window.dispatchEvent(new CustomEvent(CONVERSATIONS_CHANGED_EVENT, { detail: { taskId } }));
+      } catch {
+        // Ignore best-effort event dispatch failures.
+      }
+    } catch {
+      // Ignore chat creation errors.
+    }
+  };
+
+  const provider = target?.provider ?? fallbackProvider;
   const providerInfo = agentConfig[provider];
   const autoApproveEnabled =
     Boolean(item.task.metadata?.autoApprove) && Boolean(agentMeta[provider]?.autoApproveFlag);
   const isMultiAgentTask = Boolean(item.task.metadata?.multiAgent?.enabled);
+  const modalInstalledAgents = installedAgents.length > 0 ? installedAgents : [provider];
+
+  const conversationTabs = useMemo(() => {
+    if (sortedConversations.length === 0) {
+      return [];
+    }
+
+    const totalByProvider = new Map<ProviderId, number>();
+    for (const conversation of sortedConversations) {
+      const conversationProvider = resolveConversationProvider(conversation, fallbackProvider);
+      totalByProvider.set(conversationProvider, (totalByProvider.get(conversationProvider) || 0) + 1);
+    }
+
+    const seenByProvider = new Map<ProviderId, number>();
+    return sortedConversations.map((conversation) => {
+      const conversationProvider = resolveConversationProvider(conversation, fallbackProvider);
+      const index = (seenByProvider.get(conversationProvider) || 0) + 1;
+      seenByProvider.set(conversationProvider, index);
+      const duplicateCount = totalByProvider.get(conversationProvider) || 0;
+
+      return {
+        id: conversation.id,
+        provider: conversationProvider,
+        providerInfo: agentConfig[conversationProvider],
+        label: agentConfig[conversationProvider]?.name || conversationProvider,
+        index: duplicateCount > 1 ? index : null,
+      };
+    });
+  }, [sortedConversations, fallbackProvider]);
 
   const handleTileDragOver = (event: React.DragEvent<HTMLElement>) => {
     if (hasFilesInDataTransfer(event.dataTransfer)) {
@@ -427,63 +584,110 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
         }
       }}
     >
+      <CreateChatModal
+        isOpen={showCreateChatModal}
+        onClose={() => setShowCreateChatModal(false)}
+        onCreateChat={handleCreateChat}
+        installedAgents={modalInstalledAgents}
+      />
+
       <header
         className={cn(
-          'flex h-[clamp(46px,6.2vh,62px)] items-center justify-between gap-1.5 overflow-hidden border-b border-border bg-muted/30 px-2.5 py-0.5 transition-colors',
+          'flex h-[clamp(36px,5.4vh,46px)] items-center gap-1.5 overflow-hidden border-b border-border bg-muted/30 px-2.5 py-0.5 transition-colors',
           active && 'bg-accent/70',
           needsAttention && 'bg-orange-500/15'
         )}
       >
-        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-          <button
-            type="button"
-            draggable
-            onDragStart={(event) => {
-              event.dataTransfer.effectAllowed = 'move';
-              event.dataTransfer.setData('text/plain', item.key);
-              onDragHandleStart(item.key);
-            }}
-            onDragEnd={onDragHandleEnd}
-            onMouseDown={(event) => event.stopPropagation()}
-            className="inline-flex h-5 w-5 shrink-0 cursor-grab items-center justify-center rounded-sm border border-border bg-background text-muted-foreground hover:bg-muted active:cursor-grabbing"
-            title="Drag to reorder"
-            aria-label={`Drag task ${item.task.name}`}
-          >
-            <GripVertical className="h-2.5 w-2.5" />
-          </button>
-          <div className="min-w-0 flex-1 overflow-hidden">
-            <div className="truncate text-[12px] font-medium leading-tight text-foreground">
-              {item.task.name}
-            </div>
-            <div className="flex items-center gap-1 overflow-hidden whitespace-nowrap text-[9px] text-muted-foreground">
-              {providerInfo?.logo ? (
-                <AgentLogo
-                  logo={providerInfo.logo}
-                  alt={providerInfo.alt}
-                  isSvg={providerInfo.isSvg}
-                  invertInDark={providerInfo.invertInDark}
-                  className="h-3 w-3"
-                />
-              ) : null}
-              <span className="min-w-0 truncate">{providerInfo?.name || provider}</span>
-              {showProjectBadge ? (
-                <span className="max-w-[7rem] shrink-0 truncate rounded-sm border border-border bg-muted/60 px-1 py-0 text-[9px] text-muted-foreground">
-                  {item.project.name}
-                </span>
-              ) : null}
-              {autoApproveEnabled ? (
-                <span className="shrink-0 rounded-sm bg-orange-500/15 px-1 py-0 text-[9px] text-orange-600">
-                  Auto
-                </span>
-              ) : null}
-              {needsAttention ? (
-                <span className="shrink-0 rounded-sm bg-orange-500/20 px-1 py-0 text-[9px] font-medium text-orange-700">
-                  Needs input
-                </span>
-              ) : null}
-            </div>
-          </div>
+        <button
+          type="button"
+          draggable
+          onDragStart={(event) => {
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('text/plain', item.key);
+            onDragHandleStart(item.key);
+          }}
+          onDragEnd={onDragHandleEnd}
+          onMouseDown={(event) => event.stopPropagation()}
+          className="inline-flex h-5 w-5 shrink-0 cursor-grab items-center justify-center rounded-sm border border-border bg-background text-muted-foreground hover:bg-muted active:cursor-grabbing"
+          title="Drag to reorder"
+          aria-label={`Drag task ${item.task.name}`}
+        >
+          <GripVertical className="h-2.5 w-2.5" />
+        </button>
+
+        <div className="flex min-w-0 shrink-0 items-center gap-1 overflow-hidden whitespace-nowrap text-[10px]">
+          <span className="max-w-[12rem] truncate text-[12px] font-medium text-foreground">
+            {item.task.name}
+          </span>
+          {showProjectBadge ? (
+            <span className="max-w-[8rem] shrink-0 truncate rounded-sm border border-border bg-muted/60 px-1 py-0 text-[9px] text-muted-foreground">
+              {item.project.name}
+            </span>
+          ) : null}
         </div>
+
+        {!isMultiAgentTask ? (
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-0.5">
+            {conversationTabs.length > 0 ? (
+              conversationTabs.map((tab) => {
+                const isActiveTab = tab.id === activeConversationId;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleSwitchConversation(tab.id);
+                    }}
+                    aria-current={isActiveTab ? 'page' : undefined}
+                    className={cn(
+                      'inline-flex h-6 shrink-0 items-center gap-1 rounded border px-1.5 text-[10px] font-medium transition-colors',
+                      isActiveTab
+                        ? 'border-primary bg-primary/10 text-foreground'
+                        : 'border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground'
+                    )}
+                    title={tab.label}
+                  >
+                    {tab.providerInfo?.logo ? (
+                      <AgentLogo
+                        logo={tab.providerInfo.logo}
+                        alt={tab.providerInfo.alt}
+                        isSvg={tab.providerInfo.isSvg}
+                        invertInDark={tab.providerInfo.invertInDark}
+                        className="h-3 w-3 shrink-0"
+                      />
+                    ) : null}
+                    <span className="max-w-[8rem] truncate">
+                      {tab.label}
+                      {tab.index ? <span className="ml-1 opacity-60">{tab.index}</span> : null}
+                    </span>
+                  </button>
+                );
+              })
+            ) : (
+              <span className="inline-flex h-6 items-center rounded border border-border bg-background px-1.5 text-[10px] text-muted-foreground">
+                {providerInfo?.name || provider}
+              </span>
+            )}
+
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-6 w-6 shrink-0 p-0"
+              onClick={(event) => {
+                event.stopPropagation();
+                setShowCreateChatModal(true);
+              }}
+              title="New chat"
+              aria-label={`Create new chat for ${item.task.name}`}
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        ) : (
+          <div className="min-w-0 flex-1" />
+        )}
 
         <div className="flex shrink-0 items-center gap-0.5">
           {busy ? <Spinner size="sm" className="h-3 w-3 text-muted-foreground" /> : null}
@@ -626,6 +830,7 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
   const [projectPickerSlotIndex, setProjectPickerSlotIndex] = useState<number | null>(null);
   const [columnFractions, setColumnFractions] = useState<number[]>(createEqualFractions(2));
   const [rowFractions, setRowFractions] = useState<number[]>(createEqualFractions(2));
+  const [installedAgents, setInstalledAgents] = useState<string[]>([]);
   const prevScopedKeysRef = useRef<string[]>([]);
   const gridSurfaceRef = useRef<HTMLDivElement | null>(null);
   const resizeDragRef = useRef<ResizeDragState | null>(null);
@@ -636,6 +841,53 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
   useEffect(() => {
     setScopeProjectId(loadGridScopeProjectId());
     setSlotCount(loadGridSlotCount());
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const getProviderStatuses = window.electronAPI.getProviderStatuses;
+    if (!getProviderStatuses) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const loadInstalledAgents = async () => {
+      try {
+        const result = await getProviderStatuses();
+        if (cancelled) return;
+        if (!result?.success || !result.statuses) return;
+
+        const statuses = result.statuses as Record<string, { installed?: boolean } | undefined>;
+        const nextInstalled = Object.entries(statuses)
+          .filter(([, status]) => status?.installed === true)
+          .map(([providerId]) => providerId);
+        setInstalledAgents(nextInstalled);
+      } catch {
+        // Ignore provider status load failures.
+      }
+    };
+
+    const offProviderStatusUpdated = window.electronAPI.onProviderStatusUpdated?.(
+      (payload: { providerId: string; status?: { installed?: boolean } }) => {
+        if (!payload?.providerId) return;
+        setInstalledAgents((current) => {
+          const isInstalled = payload.status?.installed === true;
+          if (isInstalled) {
+            if (current.includes(payload.providerId)) return current;
+            return [...current, payload.providerId];
+          }
+          return current.filter((providerId) => providerId !== payload.providerId);
+        });
+      }
+    );
+
+    void loadInstalledAgents();
+
+    return () => {
+      cancelled = true;
+      offProviderStatusUpdated?.();
+    };
   }, []);
 
   const clearResizeListeners = () => {
@@ -1067,6 +1319,7 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
                         }
                         isDropTarget={draggedItemKey !== null && dragOverIndex === index}
                         showProjectBadge={showProjectBadge}
+                        installedAgents={installedAgents}
                         onSelectTaskInProject={onSelectTaskInProject}
                         onOpenTaskInProject={onOpenTaskInProject}
                         onDragHandleStart={setDraggedItemKey}
