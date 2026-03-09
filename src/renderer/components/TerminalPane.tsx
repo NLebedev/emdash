@@ -1,7 +1,6 @@
 import React, {
   useEffect,
   useRef,
-  useMemo,
   forwardRef,
   useImperativeHandle,
   useState,
@@ -10,6 +9,7 @@ import React, {
 import { terminalSessionRegistry } from '../terminal/SessionRegistry';
 import type { SessionTheme } from '../terminal/TerminalSessionManager';
 import { log } from '../lib/logger';
+import { cn } from '@/lib/utils';
 import { extractDroppedFilePaths } from '../lib/dndFilePaths';
 import ExternalLinkModal from './ExternalLinkModal';
 
@@ -28,7 +28,6 @@ type Props = {
   providerId?: string;
   autoApprove?: boolean;
   env?: Record<string, string>;
-  keepAlive?: boolean;
   mapShiftEnterToCtrlJ?: boolean;
   disableSnapshots?: boolean;
   onActivity?: () => void;
@@ -51,7 +50,6 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
       providerId,
       autoApprove = false,
       env,
-      keepAlive = false,
       mapShiftEnterToCtrlJ = false,
       disableSnapshots = false,
       onActivity,
@@ -67,7 +65,6 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
     ref
   ) => {
     const containerRef = useRef<HTMLDivElement>(null);
-    const sessionCreatedRef = useRef(false);
     const terminalIdRef = useRef(id);
     const remoteRef = useRef(remote);
     const onStartSuccessRef = useRef(onStartSuccess);
@@ -99,52 +96,31 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
       const container = containerRef.current;
       if (!container) return;
 
-      const setupSession = async () => {
-        try {
-          const session = await terminalSessionRegistry.getOrCreateSession(ptyId, {
-            cwd,
-            remote: remoteRef.current,
-            providerId,
-            autoApprove,
-            env,
-            keepAlive,
-            mapShiftEnterToCtrlJ,
-            disableSnapshots,
-            onActivity,
-            initialPrompt: initialPromptRef.current,
-            onFirstMessage: (msg) => onFirstMessageRef.current?.(msg),
-          });
+      try {
+        terminalSessionRegistry.attach({
+          taskId: ptyId,
+          container,
+          cwd,
+          remote: remoteRef.current,
+          providerId,
+          autoApprove,
+          env,
+          mapShiftEnterToCtrlJ,
+          disableSnapshots,
+          theme: themeOverride || { base: variant === 'dark' ? 'dark' : 'light' },
+          initialPrompt: initialPromptRef.current,
+          onFirstMessage: (msg: string) => onFirstMessageRef.current?.(msg),
+          initialSize: { cols: 80, rows: 24 }, // initial size will be adjusted by ResizeObserver in TerminalSessionManager
+        });
 
-          if (!container) return;
-          session.attach(container, {
-            variant,
-            themeOverride,
-          });
-          onStartSuccessRef.current?.();
-        } catch (error) {
-          log.error('[TerminalPane] failed to create session', error);
-          onStartErrorRef.current?.(error instanceof Error ? error.message : String(error));
-        }
-      };
-
-      if (!sessionCreatedRef.current) {
-        sessionCreatedRef.current = true;
-        setupSession();
-      } else {
-        const session = terminalSessionRegistry.getSession(ptyId);
-        if (session) {
-          session.attach(container, {
-            variant,
-            themeOverride,
-          });
-        }
+        onStartSuccessRef.current?.();
+      } catch (error) {
+        log.error('[TerminalPane] failed to attach session', error);
+        onStartErrorRef.current?.(error instanceof Error ? error.message : String(error));
       }
 
       return () => {
-        const session = terminalSessionRegistry.getSession(ptyId);
-        if (session) {
-          session.detach();
-        }
+        terminalSessionRegistry.detach(ptyId);
       };
     }, [
       id,
@@ -152,10 +128,8 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
       providerId,
       autoApprove,
       env,
-      keepAlive,
       mapShiftEnterToCtrlJ,
       disableSnapshots,
-      onActivity,
       variant,
       themeOverride,
     ]);
@@ -188,7 +162,7 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
           // SSH terminal: transfer files to remote first via scp
           try {
             const result = await window.electronAPI.ptyScpToRemote({
-              id: terminalIdRef.current,
+              connectionId: remoteRef.current.connectionId,
               localPaths: paths,
             });
             if (result.success && result.remotePaths) {
@@ -237,8 +211,12 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
         />
         <ExternalLinkModal
           url={externalLink || ''}
-          isOpen={!!externalLink}
-          onClose={() => setExternalLink(null)}
+          open={!!externalLink}
+          onOpenChange={(open) => !open && setExternalLink(null)}
+          onConfirm={() => {
+            if (externalLink) window.electronAPI.openExternal(externalLink);
+            setExternalLink(null);
+          }}
         />
       </div>
     );

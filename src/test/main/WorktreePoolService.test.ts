@@ -3,7 +3,15 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync } from 'child_process';
-import { WorktreePoolService } from './WorktreePoolService';
+
+vi.mock('electron', () => ({
+  app: {
+    getPath: vi.fn((name) => path.join(os.tmpdir(), `emdash-test-${name}`)),
+    getAppPath: vi.fn(() => process.cwd()),
+  },
+}));
+
+import { WorktreePoolService } from '../../main/services/WorktreePoolService';
 
 describe('WorktreePoolService', () => {
   let tempDir: string;
@@ -24,6 +32,7 @@ describe('WorktreePoolService', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'emdash-test-'));
     projectPath = path.join(tempDir, 'project');
     initRepo(projectPath);
+    process.env.EMDASH_DB_FILE = path.join(tempDir, 'test.db');
     pool = new WorktreePoolService();
     // Disable background replenish for tests to avoid race conditions
     (pool as any).replenishReserve = () => {};
@@ -32,6 +41,7 @@ describe('WorktreePoolService', () => {
   afterEach(async () => {
     await pool.cleanup();
     fs.rmSync(tempDir, { recursive: true, force: true });
+    delete process.env.EMDASH_DB_FILE;
   });
 
   it('creates and claims a reserve worktree', async () => {
@@ -43,7 +53,6 @@ describe('WorktreePoolService', () => {
     expect(fs.existsSync(reserve!.path)).toBe(true);
 
     const result = await pool.claimReserve('project-1', projectPath, 'Feature Task', 'HEAD');
-    expect(result).not.toBeNull();
     expect(result).not.toBeNull();
     expect(result!.worktree.name).toBe('Feature Task');
     expect(fs.existsSync(result!.worktree.path)).toBe(true);
@@ -75,9 +84,13 @@ describe('WorktreePoolService', () => {
   });
 
   it('creates a reserve with custom .emdash.json settings', async () => {
+    // Create a file that should be preserved via custom pattern
+    const customDir = path.join(projectPath, 'custom-config');
+    fs.mkdirSync(customDir, { recursive: true });
+    fs.writeFileSync(path.join(customDir, 'settings.json'), '{"test":true}');
+
     const config = {
       preservePatterns: ['custom-config/**'],
-      shellSetup: 'touch workspace-write',
     };
     fs.writeFileSync(path.join(projectPath, '.emdash.json'), JSON.stringify(config));
 
@@ -85,8 +98,9 @@ describe('WorktreePoolService', () => {
     const result = await pool.claimReserve('project-1', projectPath, 'Feature Task', 'HEAD');
 
     expect(result).not.toBeNull();
-    const settingsPath = path.join(result!.worktree.path, 'workspace-write');
-    expect(fs.readFileSync(settingsPath, 'utf8')).toContain('workspace-write');
+    const preservedPath = path.join(result!.worktree.path, 'custom-config/settings.json');
+    expect(fs.existsSync(preservedPath)).toBe(true);
+    expect(fs.readFileSync(preservedPath, 'utf8')).toBe('{"test":true}');
   });
 
   it('creates a reserve even when PATH is oversized', async () => {

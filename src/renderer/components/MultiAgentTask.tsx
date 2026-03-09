@@ -585,29 +585,30 @@ const MultiAgentTask: React.FC<Props> = ({
                         ? (initialInjection ?? undefined)
                         : undefined
                     }
-                    keepAlive
                     mapShiftEnterToCtrlJ
                     variant={isDark ? 'dark' : 'light'}
-                    themeOverride={
-                      v.agent === 'mistral'
-                        ? {
-                            background:
-                              effectiveTheme === 'dark-black'
-                                ? '#141820'
-                                : isDark
-                                  ? '#202938'
-                                  : '#ffffff',
-                            selectionBackground: 'rgba(96, 165, 250, 0.35)',
-                            selectionForeground: isDark ? '#f9fafb' : '#0f172a',
-                          }
-                        : effectiveTheme === 'dark-black'
+                    themeOverride={{
+                      base: isDark ? 'dark' : 'light',
+                      override:
+                        v.agent === 'mistral'
                           ? {
-                              background: '#000000',
+                              background:
+                                effectiveTheme === 'dark-black'
+                                  ? '#141820'
+                                  : isDark
+                                    ? '#202938'
+                                    : '#ffffff',
                               selectionBackground: 'rgba(96, 165, 250, 0.35)',
-                              selectionForeground: '#f9fafb',
+                              selectionForeground: isDark ? '#f9fafb' : '#0f172a',
                             }
-                          : undefined
-                    }
+                          : effectiveTheme === 'dark-black'
+                            ? {
+                                background: '#000000',
+                                selectionBackground: 'rgba(96, 165, 250, 0.35)',
+                                selectionForeground: '#f9fafb',
+                              }
+                            : undefined,
+                    }}
                     className="h-full w-full"
                     onStartSuccess={() => {
                       // For agents WITHOUT CLI flag support or with keystroke injection, type prompt in

@@ -33,12 +33,6 @@ import { generateTaskName } from '../lib/branchNameGenerator';
 import { ensureUniqueTaskName } from '../lib/taskNames';
 import type { Project } from '../types/app';
 
-declare const window: Window & {
-  electronAPI: {
-    saveMessage: (message: any) => Promise<{ success: boolean; error?: string }>;
-  };
-};
-
 interface Props {
   task: Task;
   project?: Project | null;
@@ -1039,6 +1033,8 @@ const ChatInterface: React.FC<Props> = ({
     return null;
   }
 
+  const isDark = effectiveTheme === 'dark' || effectiveTheme === 'dark-black';
+
   return (
     <TaskScopeProvider value={{ taskId: task.id, taskPath: task.path }}>
       <div
@@ -1049,16 +1045,6 @@ const ChatInterface: React.FC<Props> = ({
           onClose={() => setShowCreateChatModal(false)}
           onCreateChat={handleCreateChat}
           installedAgents={installedAgents}
-        />
-
-        <DeleteChatModal
-          open={showDeleteChatModal}
-          onOpenChange={setShowDeleteChatModal}
-          onConfirm={handleConfirmDeleteChat}
-          onCancel={() => {
-            setChatToDelete(null);
-            setShowDeleteChatModal(false);
-          }}
         />
 
         <div className="flex min-h-0 flex-1 flex-col">
@@ -1194,7 +1180,6 @@ const ChatInterface: React.FC<Props> = ({
                   providerId={agent}
                   autoApprove={autoApproveEnabled}
                   env={taskEnv}
-                  keepAlive={true}
                   mapShiftEnterToCtrlJ
                   disableSnapshots={false}
                   onActivity={() => {
@@ -1218,40 +1203,41 @@ const ChatInterface: React.FC<Props> = ({
                       });
                     }
                   }}
-                  variant={
-                    effectiveTheme === 'dark' || effectiveTheme === 'dark-black' ? 'dark' : 'light'
-                  }
-                  themeOverride={
-                    agent === 'charm'
-                      ? {
-                          background:
-                            effectiveTheme === 'dark-black'
-                              ? '#0a0a0a'
-                              : effectiveTheme === 'dark'
-                                ? '#1f2937'
-                                : '#ffffff',
-                          selectionBackground: 'rgba(96, 165, 250, 0.35)',
-                          selectionForeground: effectiveTheme === 'light' ? '#0f172a' : '#f9fafb',
-                        }
-                      : agent === 'mistral'
+                  variant={isDark ? 'dark' : 'light'}
+                  themeOverride={{
+                    base: isDark ? 'dark' : 'light',
+                    override:
+                      agent === 'charm'
                         ? {
                             background:
                               effectiveTheme === 'dark-black'
-                                ? '#141820'
+                                ? '#0a0a0a'
                                 : effectiveTheme === 'dark'
-                                  ? '#202938'
+                                  ? '#1f2937'
                                   : '#ffffff',
                             selectionBackground: 'rgba(96, 165, 250, 0.35)',
                             selectionForeground: effectiveTheme === 'light' ? '#0f172a' : '#f9fafb',
                           }
-                        : effectiveTheme === 'dark-black'
+                        : agent === 'mistral'
                           ? {
-                              background: '#000000',
+                              background:
+                                effectiveTheme === 'dark-black'
+                                  ? '#141820'
+                                  : effectiveTheme === 'dark'
+                                    ? '#202938'
+                                    : '#ffffff',
                               selectionBackground: 'rgba(96, 165, 250, 0.35)',
-                              selectionForeground: '#f9fafb',
+                              selectionForeground:
+                                effectiveTheme === 'light' ? '#0f172a' : '#f9fafb',
                             }
-                          : undefined
-                  }
+                          : effectiveTheme === 'dark-black'
+                            ? {
+                                background: '#000000',
+                                selectionBackground: 'rgba(96, 165, 250, 0.35)',
+                                selectionForeground: '#f9fafb',
+                              }
+                            : undefined,
+                  }}
                   contentFilter={
                     agent === 'charm' &&
                     effectiveTheme !== 'dark' &&

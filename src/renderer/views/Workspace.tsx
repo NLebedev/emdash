@@ -184,7 +184,10 @@ export function Workspace() {
     return () => cleanup?.();
   }, []);
 
+  // --- Project management (provided by ProjectManagementProvider in App.tsx) ---
+  const projectMgmt = useProjectManagementContext();
   const {
+    projects,
     selectedProject,
     showEditorMode,
     setShowEditorMode,
@@ -198,20 +201,20 @@ export function Workspace() {
     if (!selectedProject) return;
     setShowEditorMode(false);
     setShowTaskGrid(false);
-    setShowKanban((v) => !v);
+    setShowKanban((v: boolean) => !v);
   }, [selectedProject, setShowEditorMode, setShowKanban, setShowTaskGrid]);
 
   const handleToggleEditor = useCallback(() => {
     setShowKanban(false);
     setShowTaskGrid(false);
-    setShowEditorMode((v) => !v);
+    setShowEditorMode((v: boolean) => !v);
   }, [setShowKanban, setShowEditorMode, setShowTaskGrid]);
 
   const handleToggleTaskGrid = useCallback(() => {
     if (!selectedProject) return;
     setShowEditorMode(false);
     setShowKanban(false);
-    setShowTaskGrid((v) => !v);
+    setShowTaskGrid((v: boolean) => !v);
   }, [selectedProject, setShowEditorMode, setShowKanban, setShowTaskGrid]);
 
   const handleCloseEditor = useCallback(() => setShowEditorMode(false), [setShowEditorMode]);

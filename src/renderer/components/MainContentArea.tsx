@@ -74,8 +74,8 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
     return (
       <HomeView
         onOpenProject={handleOpenProject}
-        onNewProject={handleNewProjectClick}
-        onCloneProject={handleCloneProjectClick}
+        onNewProjectClick={handleNewProjectClick}
+        onCloneProjectClick={handleCloneProjectClick}
         onAddRemoteProject={handleAddRemoteProject}
       />
     );
