@@ -41,6 +41,10 @@ vi.mock('../../main/services/DatabaseService', () => ({
   },
 }));
 
+vi.mock('../../main/utils/remoteProjectResolver', () => ({
+  resolveRemoteProjectForWorktreePath: vi.fn(async () => null),
+}));
+
 vi.mock('../../main/lib/logger', () => ({
   log: {
     debug: vi.fn(),

@@ -2,6 +2,7 @@ import type { ProviderId } from '@shared/providers/registry';
 import { type LinearIssueSummary } from './linear';
 import { type GitHubIssueSummary } from './github';
 import { type JiraIssueSummary } from './jira';
+import { type PlainThreadSummary } from './plain';
 
 /** Per-agent run configuration for task creation */
 export interface AgentRun {
@@ -19,10 +20,15 @@ export interface TaskMetadata {
   linearIssue?: LinearIssueSummary | null;
   githubIssue?: GitHubIssueSummary | null;
   jiraIssue?: JiraIssueSummary | null;
+  plainThread?: PlainThreadSummary | null;
   initialPrompt?: string | null;
   autoApprove?: boolean | null;
+  /** True when the task name was auto-generated (not manually typed by the user) */
+  nameGenerated?: boolean | null;
   /** Set to true after the initial injection (prompt/issue) has been sent to the agent */
   initialInjectionSent?: boolean | null;
+  /** Whether this task is pinned to the top of the sidebar */
+  isPinned?: boolean | null;
   // When present, this task is a multi-agent task orchestrating multiple worktrees
   multiAgent?: {
     enabled: boolean;
@@ -53,6 +59,7 @@ export interface Task {
   status: 'active' | 'idle' | 'running';
   metadata?: TaskMetadata | null;
   useWorktree?: boolean;
+  archivedAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
   agentId?: string;

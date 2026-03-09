@@ -37,13 +37,15 @@ export function registerLifecycleIpc(): void {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }
     ) => {
       try {
         const result = await taskLifecycleService.runSetup(
           args.taskId,
           args.taskPath,
-          args.projectPath
+          args.projectPath,
+          args.taskName
         );
         return { success: result.ok, ...result };
       } catch (error) {
@@ -61,13 +63,15 @@ export function registerLifecycleIpc(): void {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }
     ) => {
       try {
         const result = await taskLifecycleService.startRun(
           args.taskId,
           args.taskPath,
-          args.projectPath
+          args.projectPath,
+          args.taskName
         );
         return { success: result.ok, ...result };
       } catch (error) {
@@ -95,13 +99,15 @@ export function registerLifecycleIpc(): void {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }
     ) => {
       try {
         const result = await taskLifecycleService.runTeardown(
           args.taskId,
           args.taskPath,
-          args.projectPath
+          args.projectPath,
+          args.taskName
         );
         return { success: result.ok, ...result };
       } catch (error) {
@@ -117,6 +123,16 @@ export function registerLifecycleIpc(): void {
       return { success: true, state };
     } catch (error) {
       log.error('Failed to get lifecycle state:', error);
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('lifecycle:getLogs', async (_event, args: { taskId: string }) => {
+    try {
+      const logs = taskLifecycleService.getLogs(args.taskId);
+      return { success: true, logs };
+    } catch (error) {
+      log.error('Failed to get lifecycle logs:', error);
       return { success: false, error: (error as Error).message };
     }
   });

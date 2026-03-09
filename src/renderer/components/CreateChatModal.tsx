@@ -14,6 +14,7 @@ import { AgentDropdown } from './AgentDropdown';
 import { agentConfig } from '../lib/agentConfig';
 import { isValidProviderId } from '@shared/providers/registry';
 import type { Agent } from '../types';
+import { rpc } from '@/lib/rpc';
 
 const DEFAULT_AGENT: Agent = 'claude';
 
@@ -42,10 +43,9 @@ export function CreateChatModal({
       setError(null);
 
       let cancel = false;
-      window.electronAPI.getSettings().then((res) => {
+      rpc.appSettings.get().then((settings) => {
         if (cancel) return;
 
-        const settings = res?.success ? res.settings : undefined;
         const settingsAgent = settings?.defaultProvider;
         const defaultFromSettings: Agent = isValidProviderId(settingsAgent)
           ? (settingsAgent as Agent)
@@ -100,9 +100,10 @@ export function CreateChatModal({
     <Dialog open={isOpen} onOpenChange={(open) => !open && !isCreating && onClose()}>
       <DialogContent className="max-h-[calc(100vh-48px)] max-w-md overflow-visible">
         <DialogHeader>
-          <DialogTitle>New Chat</DialogTitle>
+          <DialogTitle>Add Agent to Task</DialogTitle>
           <DialogDescription className="text-xs">
-            Start a new conversation with any agent
+            Add another agent to this chat. It will share the same worktree and appear as a new tab
+            alongside your existing chats.
           </DialogDescription>
         </DialogHeader>
 

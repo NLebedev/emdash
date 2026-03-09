@@ -5,9 +5,12 @@ import { promisify } from 'node:util';
 import { lifecycleScriptsService } from './LifecycleScriptsService';
 import {
   type LifecycleEvent,
+  type LifecycleLogs,
   type LifecyclePhase,
   type LifecyclePhaseState,
   type TaskLifecycleState,
+  MAX_LIFECYCLE_LOG_LINES,
+  formatLifecycleLogLine,
 } from '@shared/lifecycle';
 import { getTaskEnvVars } from '@shared/task/envVars';
 import { log } from '../lib/logger';
@@ -23,6 +26,7 @@ type LifecycleResult = {
 
 class TaskLifecycleService extends EventEmitter {
   private states = new Map<string, TaskLifecycleState>();
+  private logBuffers = new Map<string, LifecycleLogs>();
   private runProcesses = new Map<string, ChildProcess>();
   private finiteProcesses = new Map<string, Set<ChildProcess>>();
   private runStartInflight = new Map<string, Promise<LifecycleResult>>();
@@ -103,10 +107,11 @@ class TaskLifecycleService extends EventEmitter {
   private async buildLifecycleEnv(
     taskId: string,
     taskPath: string,
-    projectPath: string
+    projectPath: string,
+    taskName?: string
   ): Promise<NodeJS.ProcessEnv> {
     const defaultBranch = await this.resolveDefaultBranch(projectPath);
-    const taskName = path.basename(taskPath) || taskId;
+    taskName = taskName || path.basename(taskPath) || taskId;
     const taskEnv = getTaskEnvVars({
       taskId,
       taskName,
@@ -139,6 +144,35 @@ class TaskLifecycleService extends EventEmitter {
     return state;
   }
 
+  private ensureLogBuffer(taskId: string): LifecycleLogs {
+    const existing = this.logBuffers.get(taskId);
+    if (existing) return existing;
+    const buf: LifecycleLogs = { setup: [], run: [], teardown: [] };
+    this.logBuffers.set(taskId, buf);
+    return buf;
+  }
+
+  private appendLog(taskId: string, phase: LifecyclePhase, line: string): void {
+    const buf = this.ensureLogBuffer(taskId);
+    const arr = buf[phase];
+    arr.push(line);
+    if (arr.length > MAX_LIFECYCLE_LOG_LINES) {
+      arr.splice(0, arr.length - MAX_LIFECYCLE_LOG_LINES);
+    }
+  }
+
+  private buildErrorDetail(taskId: string, phase: LifecyclePhase, baseError: string): string {
+    const buf = this.logBuffers.get(taskId);
+    const lines = buf?.[phase] ?? [];
+    // Grab last few non-empty output lines for context
+    const tail = lines
+      .map((l) => l.replace(/^\[.*?\]\s*/, '').trim())
+      .filter(Boolean)
+      .slice(-5);
+    if (tail.length === 0) return baseError;
+    return `${baseError}\n${tail.join('\n')}`;
+  }
+
   private emitLifecycleEvent(
     taskId: string,
     phase: LifecyclePhase,
@@ -152,6 +186,13 @@ class TaskLifecycleService extends EventEmitter {
       timestamp: this.nowIso(),
       ...(extras || {}),
     };
+
+    // Buffer log lines so they survive task switches in the renderer
+    const line = formatLifecycleLogLine(phase, status, extras);
+    if (line !== null) {
+      this.appendLog(taskId, phase, line);
+    }
+
     this.emit('event', evt);
   }
 
@@ -159,7 +200,8 @@ class TaskLifecycleService extends EventEmitter {
     taskId: string,
     taskPath: string,
     projectPath: string,
-    phase: Extract<LifecyclePhase, 'setup' | 'teardown'>
+    phase: Extract<LifecyclePhase, 'setup' | 'teardown'>,
+    taskName?: string
   ): Promise<LifecycleResult> {
     const script = lifecycleScriptsService.getScript(projectPath, phase);
     if (!script) return Promise.resolve({ ok: true, skipped: true });
@@ -184,7 +226,7 @@ class TaskLifecycleService extends EventEmitter {
           resolve(result);
         };
         try {
-          const env = await this.buildLifecycleEnv(taskId, taskPath, projectPath);
+          const env = await this.buildLifecycleEnv(taskId, taskPath, projectPath, taskName);
           const child = spawn(script, {
             cwd: taskPath,
             shell: true,
@@ -202,8 +244,9 @@ class TaskLifecycleService extends EventEmitter {
             untrackFinite();
             const message = error?.message || String(error);
             this.emitLifecycleEvent(taskId, phase, 'error', { error: message });
+            const detail = this.buildErrorDetail(taskId, phase, message);
             finish(
-              { ok: false, error: message },
+              { ok: false, error: detail },
               {
                 ...state[phase],
                 status: 'failed',
@@ -219,12 +262,14 @@ class TaskLifecycleService extends EventEmitter {
               exitCode: code,
               ...(ok ? {} : { error: `Exited with code ${String(code)}` }),
             });
-            finish(ok ? { ok: true } : { ok: false, error: `Exited with code ${String(code)}` }, {
+            const errorMsg = `Exited with code ${String(code)}`;
+            const detail = ok ? undefined : this.buildErrorDetail(taskId, phase, errorMsg);
+            finish(ok ? { ok: true } : { ok: false, error: detail }, {
               ...state[phase],
               status: ok ? 'succeeded' : 'failed',
               finishedAt: this.nowIso(),
               exitCode: code,
-              error: ok ? null : `Exited with code ${String(code)}`,
+              error: ok ? null : errorMsg,
             });
           });
         } catch (error) {
@@ -244,23 +289,33 @@ class TaskLifecycleService extends EventEmitter {
     });
   }
 
-  async runSetup(taskId: string, taskPath: string, projectPath: string): Promise<LifecycleResult> {
+  async runSetup(
+    taskId: string,
+    taskPath: string,
+    projectPath: string,
+    taskName?: string
+  ): Promise<LifecycleResult> {
     const key = this.inflightKey(taskId, taskPath);
     if (this.setupInflight.has(key)) {
       return this.setupInflight.get(key)!;
     }
-    const run = this.runFinite(taskId, taskPath, projectPath, 'setup').finally(() => {
+    const run = this.runFinite(taskId, taskPath, projectPath, 'setup', taskName).finally(() => {
       this.setupInflight.delete(key);
     });
     this.setupInflight.set(key, run);
     return run;
   }
 
-  async startRun(taskId: string, taskPath: string, projectPath: string): Promise<LifecycleResult> {
+  async startRun(
+    taskId: string,
+    taskPath: string,
+    projectPath: string,
+    taskName?: string
+  ): Promise<LifecycleResult> {
     const inflight = this.runStartInflight.get(taskId);
     if (inflight) return inflight;
 
-    const run = this.startRunInternal(taskId, taskPath, projectPath).finally(() => {
+    const run = this.startRunInternal(taskId, taskPath, projectPath, taskName).finally(() => {
       if (this.runStartInflight.get(taskId) === run) {
         this.runStartInflight.delete(taskId);
       }
@@ -272,19 +327,20 @@ class TaskLifecycleService extends EventEmitter {
   private async startRunInternal(
     taskId: string,
     taskPath: string,
-    projectPath: string
+    projectPath: string,
+    taskName?: string
   ): Promise<LifecycleResult> {
     const setupScript = lifecycleScriptsService.getScript(projectPath, 'setup');
     if (setupScript) {
       const setupStatus = this.ensureState(taskId).setup.status;
-      if (setupStatus === 'running') {
+      if (setupStatus === 'idle' || setupStatus === 'failed') {
+        log.info(`Auto-running setup before run (state was ${setupStatus})`, { taskId });
+        const setupResult = await this.runSetup(taskId, taskPath, projectPath, taskName);
+        if (!setupResult.ok) {
+          return { ok: false, error: `Setup failed: ${setupResult.error}` };
+        }
+      } else if (setupStatus === 'running') {
         return { ok: false, error: 'Setup is still running' };
-      }
-      if (setupStatus === 'failed') {
-        return { ok: false, error: 'Setup failed. Fix setup before starting run' };
-      }
-      if (setupStatus !== 'succeeded') {
-        return { ok: false, error: 'Setup has not completed yet' };
       }
     }
 
@@ -292,9 +348,17 @@ class TaskLifecycleService extends EventEmitter {
     if (!script) return { ok: true, skipped: true };
 
     const existing = this.runProcesses.get(taskId);
-    if (existing && existing.exitCode === null && !existing.killed) {
+    if (
+      existing &&
+      existing.exitCode === null &&
+      !existing.killed &&
+      !this.stopIntents.has(taskId)
+    ) {
       return { ok: true, skipped: true };
     }
+
+    // Clear any residual stop intent so the new process's exit is not misclassified.
+    this.stopIntents.delete(taskId);
 
     const state = this.ensureState(taskId);
     state.run = {
@@ -308,7 +372,7 @@ class TaskLifecycleService extends EventEmitter {
     this.emitLifecycleEvent(taskId, 'run', 'starting');
 
     try {
-      const env = await this.buildLifecycleEnv(taskId, taskPath, projectPath);
+      const env = await this.buildLifecycleEnv(taskId, taskPath, projectPath, taskName);
       const child = spawn(script, {
         cwd: taskPath,
         shell: true,
@@ -401,7 +465,8 @@ class TaskLifecycleService extends EventEmitter {
   async runTeardown(
     taskId: string,
     taskPath: string,
-    projectPath: string
+    projectPath: string,
+    taskName?: string
   ): Promise<LifecycleResult> {
     const key = this.inflightKey(taskId, taskPath);
     if (this.teardownInflight.has(key)) {
@@ -435,7 +500,7 @@ class TaskLifecycleService extends EventEmitter {
           });
         });
       }
-      return this.runFinite(taskId, taskPath, projectPath, 'teardown');
+      return this.runFinite(taskId, taskPath, projectPath, 'teardown', taskName);
     })().finally(() => {
       this.teardownInflight.delete(key);
     });
@@ -447,8 +512,16 @@ class TaskLifecycleService extends EventEmitter {
     return this.ensureState(taskId);
   }
 
+  getLogs(taskId: string): LifecycleLogs {
+    const buf = this.logBuffers.get(taskId);
+    return buf
+      ? { setup: [...buf.setup], run: [...buf.run], teardown: [...buf.teardown] }
+      : { setup: [], run: [], teardown: [] };
+  }
+
   clearTask(taskId: string): void {
     this.states.delete(taskId);
+    this.logBuffers.delete(taskId);
     this.stopIntents.delete(taskId);
     this.runStartInflight.delete(taskId);
 

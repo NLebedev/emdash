@@ -12,11 +12,12 @@ import { useTheme } from '@/hooks/useTheme';
 import { classifyActivity } from '@/lib/activityClassifier';
 import { activityStore } from '@/lib/activityStore';
 import { Spinner } from './ui/spinner';
-import { BUSY_HOLD_MS, CLEAR_BUSY_MS } from '@/lib/activityConstants';
+import { BUSY_HOLD_MS, CLEAR_BUSY_MS, INJECT_ENTER_DELAY_MS } from '@/lib/activityConstants';
 import { CornerDownLeft } from 'lucide-react';
 import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from './ui/tooltip';
 import { useAutoScrollOnTaskSwitch } from '@/hooks/useAutoScrollOnTaskSwitch';
 import { getTaskEnvVars } from '@shared/task/envVars';
+import { rpc } from '@/lib/rpc';
 
 interface Props {
   task: Task;
@@ -26,6 +27,7 @@ interface Props {
   projectRemoteConnectionId?: string | null;
   projectRemotePath?: string | null;
   defaultBranch?: string | null;
+  onTaskInterfaceReady?: () => void;
 }
 
 type Variant = {
@@ -43,6 +45,7 @@ const MultiAgentTask: React.FC<Props> = ({
   projectRemoteConnectionId,
   projectRemotePath: _projectRemotePath,
   defaultBranch,
+  onTaskInterfaceReady,
 }) => {
   const { effectiveTheme } = useTheme();
   const [prompt, setPrompt] = useState('');
@@ -73,6 +76,15 @@ const MultiAgentTask: React.FC<Props> = ({
 
   // Auto-scroll to bottom when this task becomes active
   const { scrollToBottom } = useAutoScrollOnTaskSwitch(true, task.id);
+
+  const readySignaledTaskIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!onTaskInterfaceReady) return;
+    if (variants.length === 0) return;
+    if (readySignaledTaskIdRef.current === task.id) return;
+    readySignaledTaskIdRef.current = task.id;
+    onTaskInterfaceReady();
+  }, [task.id, variants.length, onTaskInterfaceReady]);
 
   // Helper to generate display label with instance number if needed
   const getVariantDisplayLabel = (variant: Variant): string => {
@@ -195,9 +207,17 @@ const MultiAgentTask: React.FC<Props> = ({
     let silenceTimer: any = null;
     const send = () => {
       if (sent) return;
+      sent = true;
       try {
-        (window as any).electronAPI?.ptyInput?.({ id: ptyId, data: trimmed + '\n' });
-        sent = true;
+        const pty = (window as any).electronAPI?.ptyInput;
+        if (!pty) return;
+        // Send text + line endings first so the TUI displays the input,
+        // then send a bare \r after a short delay to submit.  Sending
+        // Enter separately prevents TUI "paste-detection" from swallowing it.
+        pty({ id: ptyId, data: trimmed + '\r\n' });
+        setTimeout(() => {
+          pty({ id: ptyId, data: '\r' });
+        }, INJECT_ENTER_DELAY_MS);
       } catch {}
     };
     const offData = (window as any).electronAPI?.onPtyData?.(ptyId, (chunk: string) => {
@@ -396,6 +416,24 @@ const MultiAgentTask: React.FC<Props> = ({
     }
   }, [task.id, activeTabIndex, variants.length, scrollToBottom]);
 
+  useEffect(() => {
+    let mounted = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const handleWindowFocus = () => {
+      timer = setTimeout(() => {
+        timer = null;
+        if (!mounted) return;
+        activeTerminalRef.current?.focus();
+      }, 0);
+    };
+    window.addEventListener('focus', handleWindowFocus);
+    return () => {
+      mounted = false;
+      if (timer !== null) clearTimeout(timer);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
+  }, []);
+
   // Switch active agent tab via global shortcuts (Cmd+Shift+J/K)
   useEffect(() => {
     const handleAgentSwitch = (event: Event) => {
@@ -419,6 +457,21 @@ const MultiAgentTask: React.FC<Props> = ({
     };
   }, [variants.length]);
 
+  useEffect(() => {
+    const handleAgentTabSelection = (event: Event) => {
+      const customEvent = event as CustomEvent<{ tabIndex: number }>;
+      const tabIndex = customEvent.detail?.tabIndex;
+      if (typeof tabIndex !== 'number') return;
+      if (tabIndex < 0 || tabIndex >= variants.length) return;
+      setActiveTabIndex(tabIndex);
+    };
+
+    window.addEventListener('emdash:select-agent-tab', handleAgentTabSelection);
+    return () => {
+      window.removeEventListener('emdash:select-agent-tab', handleAgentTabSelection);
+    };
+  }, [variants.length]);
+
   if (!multi?.enabled) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
@@ -427,14 +480,8 @@ const MultiAgentTask: React.FC<Props> = ({
     );
   }
 
-  // Show loading state while worktrees are being created
   if (variants.length === 0) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-3">
-        <Spinner size="lg" />
-        <p className="text-sm text-muted-foreground">Creating task...</p>
-      </div>
-    );
+    return <div className="h-full" />;
   }
 
   return (
@@ -453,6 +500,7 @@ const MultiAgentTask: React.FC<Props> = ({
                   path={v.path}
                   isRemote={!!projectRemoteConnectionId}
                   sshConnectionId={projectRemoteConnectionId}
+                  isActive={isActive}
                 />
               </div>
               <div className="mt-2 flex items-center justify-center px-4 py-2">
@@ -537,29 +585,30 @@ const MultiAgentTask: React.FC<Props> = ({
                         ? (initialInjection ?? undefined)
                         : undefined
                     }
-                    keepAlive
                     mapShiftEnterToCtrlJ
                     variant={isDark ? 'dark' : 'light'}
-                    themeOverride={
-                      v.agent === 'mistral'
-                        ? {
-                            background:
-                              effectiveTheme === 'dark-black'
-                                ? '#141820'
-                                : isDark
-                                  ? '#202938'
-                                  : '#ffffff',
-                            selectionBackground: 'rgba(96, 165, 250, 0.35)',
-                            selectionForeground: isDark ? '#f9fafb' : '#0f172a',
-                          }
-                        : effectiveTheme === 'dark-black'
+                    themeOverride={{
+                      base: isDark ? 'dark' : 'light',
+                      override:
+                        v.agent === 'mistral'
                           ? {
-                              background: '#000000',
+                              background:
+                                effectiveTheme === 'dark-black'
+                                  ? '#141820'
+                                  : isDark
+                                    ? '#202938'
+                                    : '#ffffff',
                               selectionBackground: 'rgba(96, 165, 250, 0.35)',
-                              selectionForeground: '#f9fafb',
+                              selectionForeground: isDark ? '#f9fafb' : '#0f172a',
                             }
-                          : undefined
-                    }
+                          : effectiveTheme === 'dark-black'
+                            ? {
+                                background: '#000000',
+                                selectionBackground: 'rgba(96, 165, 250, 0.35)',
+                                selectionForeground: '#f9fafb',
+                              }
+                            : undefined,
+                    }}
                     className="h-full w-full"
                     onStartSuccess={() => {
                       // For agents WITHOUT CLI flag support or with keystroke injection, type prompt in
@@ -573,7 +622,7 @@ const MultiAgentTask: React.FC<Props> = ({
                       }
                       // Mark initial injection as sent so it won't re-run on restart
                       if (initialInjection && !task.metadata?.initialInjectionSent) {
-                        void window.electronAPI.saveTask({
+                        void rpc.db.saveTask({
                           ...task,
                           metadata: {
                             ...task.metadata,

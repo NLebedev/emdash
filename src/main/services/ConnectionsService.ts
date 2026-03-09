@@ -42,6 +42,15 @@ const truncate = (input: string, max = 400): string =>
 
 const DEFAULT_TIMEOUT_MS = 3000;
 
+const quoteForCmdExe = (input: string): string => {
+  if (input.length === 0) return '""';
+  if (!/[\s"^&|<>()%!]/.test(input)) return input;
+  return `"${input
+    .replace(/%/g, '%%')
+    .replace(/!/g, '^!')
+    .replace(/(["^&|<>()])/g, '^$1')}"`;
+};
+
 export const CLI_DEFINITIONS: CliDefinition[] = listDetectableProviders().map((provider) => ({
   id: provider.id,
   name: provider.name,
@@ -157,12 +166,19 @@ class ConnectionsService {
       return def.statusResolver(result);
     }
 
-    if (result.timedOut && (result.resolvedPath || result.stdout)) {
-      // CLI responded or was found, but took too long (e.g., self-updating). Treat as present.
+    if (result.success) {
       return 'connected';
     }
 
-    if (result.success) {
+    if (result.resolvedPath) {
+      return 'connected';
+    }
+
+    if (result.timedOut && result.stdout) {
+      return 'connected';
+    }
+
+    if (result.status !== null && !result.timedOut && (result.stdout || result.stderr)) {
       return 'connected';
     }
 
@@ -216,12 +232,37 @@ class ConnectionsService {
       }
     }
 
-    // Return the last attempted command (or default) as missing
-    return this.runCommand(
-      def.commands[def.commands.length - 1],
-      def.args ?? ['--version'],
-      timeoutMs
-    );
+    const lastCommand = def.commands[def.commands.length - 1];
+    return this.runCommandViaShell(lastCommand, def.args ?? ['--version'], timeoutMs);
+  }
+
+  /** Run a command through the user's login shell as a fallback for detection. */
+  private async runCommandViaShell(
+    command: string,
+    args: string[],
+    timeoutMs: number
+  ): Promise<CommandResult> {
+    const shell = process.env.SHELL || (process.platform === 'win32' ? 'cmd.exe' : '/bin/sh');
+    const fullCmd = [command, ...args].join(' ');
+    const shellArgs = process.platform === 'win32' ? ['/c', fullCmd] : ['-lc', fullCmd];
+    const result = await this.runCommand(shell, shellArgs, timeoutMs);
+
+    if (result.status === 127) {
+      return {
+        ...result,
+        command,
+        success: false,
+        resolvedPath: null,
+        status: null,
+        error: new Error(`${command}: command not found (shell fallback)`),
+      };
+    }
+
+    // Never cache the shell binary path as the provider path.
+    // If provider resolution still fails here, keep `resolvedPath` null so
+    // PTY startup falls back to shell-based spawn instead of direct-spawning the shell.
+    const providerResolvedPath = this.resolveCommandPath(command);
+    return { ...result, command, resolvedPath: providerResolvedPath };
   }
 
   private async runCommand(
@@ -232,7 +273,20 @@ class ConnectionsService {
     const resolvedPath = this.resolveCommandPath(command);
     return new Promise((resolve) => {
       try {
-        const child = spawn(command, args);
+        const executable = resolvedPath || command;
+        const lowerExecutable = executable.toLowerCase();
+        const shouldUseCmdExe =
+          process.platform === 'win32' &&
+          (lowerExecutable.endsWith('.cmd') || lowerExecutable.endsWith('.bat'));
+
+        const child = shouldUseCmdExe
+          ? spawn(process.env.ComSpec || 'cmd.exe', [
+              '/d',
+              '/s',
+              '/c',
+              [executable, ...args].map(quoteForCmdExe).join(' '),
+            ])
+          : spawn(command, args);
 
         let stdout = '';
         let stderr = '';
@@ -254,6 +308,12 @@ class ConnectionsService {
 
         child.on('error', (error) => {
           clearTimeout(timeoutId);
+          log.warn('provider:command-spawn-error', {
+            command,
+            executable,
+            resolvedPath,
+            error: error?.message || String(error),
+          });
           resolve({
             command,
             success: false,
@@ -273,6 +333,18 @@ class ConnectionsService {
 
           const success = !didTimeout && code === 0;
           const version = this.extractVersion(stdout) || this.extractVersion(stderr);
+
+          if (!success) {
+            log.warn('provider:command-exit-failed', {
+              command,
+              executable,
+              resolvedPath,
+              status: code,
+              timedOut: didTimeout,
+              stderr: stderr ? truncate(stderr) : null,
+              stdout: stdout ? truncate(stdout) : null,
+            });
+          }
 
           resolve({
             command,

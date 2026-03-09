@@ -22,19 +22,21 @@ type CreatePROptions = {
 
 export function useCreatePR() {
   const { toast } = useToast();
-  const [isCreating, setIsCreating] = useState(false);
+  const [creatingTaskPath, setCreatingTaskPath] = useState<string | null>(null);
+
+  const isCreatingForTaskPath = (path: string) => creatingTaskPath === path;
 
   const createPR = async (opts: CreatePROptions) => {
     const {
       taskPath,
-      commitMessage = 'chore: apply task changes',
+      commitMessage: explicitCommitMessage,
       createBranchIfOnDefault = true,
       branchPrefix = 'orch',
       prOptions,
       onSuccess,
     } = opts;
 
-    setIsCreating(true);
+    setCreatingTaskPath(taskPath);
     try {
       // Guard: ensure Electron bridge methods exist (prevents hard crashes in plain web builds)
       const api: any = (window as any).electronAPI;
@@ -80,6 +82,10 @@ export function useCreatePR() {
       if (!finalPrOptions.title) {
         finalPrOptions.title = taskPath.split(/[/\\]/).filter(Boolean).pop() || 'Task';
       }
+
+      // Use the generated PR title as commit message when no explicit one was provided
+      const commitMessage =
+        explicitCommitMessage || finalPrOptions.title || 'chore: apply task changes';
 
       const commitRes = await api.gitCommitAndPush({
         taskPath,
@@ -263,9 +269,9 @@ export function useCreatePR() {
       });
       return { success: false, error: message } as any;
     } finally {
-      setIsCreating(false);
+      setCreatingTaskPath(null);
     }
   };
 
-  return { isCreating, createPR };
+  return { isCreatingForTaskPath, createPR };
 }

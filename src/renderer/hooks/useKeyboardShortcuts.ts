@@ -21,7 +21,8 @@ export type ShortcutSettingsKey =
   | 'prevProject'
   | 'newTask'
   | 'nextAgent'
-  | 'prevAgent';
+  | 'prevAgent'
+  | 'openInEditor';
 
 export interface AppShortcut {
   key: string;
@@ -90,6 +91,8 @@ export function normalizeShortcutKey(value: string): string {
   if (lower === 'arrowright' || lower === 'right') return 'ArrowRight';
   if (lower === 'arrowup' || lower === 'up') return 'ArrowUp';
   if (lower === 'arrowdown' || lower === 'down') return 'ArrowDown';
+  if (lower === '{') return '[';
+  if (lower === '}') return ']';
   if (trimmed.length === 1) return trimmed.toLowerCase();
   return trimmed;
 }
@@ -182,7 +185,7 @@ export const APP_SHORTCUTS: Record<string, AppShortcut> = {
   },
 
   NEXT_AGENT: {
-    key: 'k',
+    key: ']',
     modifier: 'cmd+shift',
     label: 'Next Agent',
     description: 'Cycle through agents on a task',
@@ -191,12 +194,21 @@ export const APP_SHORTCUTS: Record<string, AppShortcut> = {
   },
 
   PREV_AGENT: {
-    key: 'j',
+    key: '[',
     modifier: 'cmd+shift',
     label: 'Previous Agent',
     description: 'Cycle through agents on a task',
     category: 'Navigation',
     settingsKey: 'prevAgent',
+  },
+
+  OPEN_IN_EDITOR: {
+    key: 'o',
+    modifier: 'cmd',
+    label: 'Open in Editor',
+    description: 'Open the project in the default editor',
+    category: 'Navigation',
+    settingsKey: 'openInEditor',
   },
 };
 
@@ -266,6 +278,24 @@ export function hasShortcutConflict(shortcut1: ShortcutConfig, shortcut2: Shortc
     normalizeShortcutKey(shortcut1.key) === normalizeShortcutKey(shortcut2.key) &&
     shortcut1.modifier === shortcut2.modifier
   );
+}
+
+export function getAgentTabSelectionIndex(
+  event: Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'>,
+  isMac = isMacPlatform
+): number | null {
+  const hasCommandModifier =
+    (isMac ? event.metaKey : event.metaKey || event.ctrlKey) && !event.shiftKey;
+  if (!hasCommandModifier || event.altKey) {
+    return null;
+  }
+
+  const key = normalizeShortcutKey(event.key);
+  if (!/^[1-9]$/.test(key)) {
+    return null;
+  }
+
+  return Number(key) - 1;
 }
 
 function matchesModifier(modifier: ShortcutModifier | undefined, event: KeyboardEvent): boolean {
@@ -356,6 +386,7 @@ export function useKeyboardShortcuts(handlers: GlobalShortcutHandlers) {
       newTask: getEffectiveConfig(APP_SHORTCUTS.NEW_TASK, custom),
       nextAgent: getEffectiveConfig(APP_SHORTCUTS.NEXT_AGENT, custom),
       prevAgent: getEffectiveConfig(APP_SHORTCUTS.PREV_AGENT, custom),
+      openInEditor: getEffectiveConfig(APP_SHORTCUTS.OPEN_IN_EDITOR, custom),
     };
   }, [handlers.customKeyboardSettings]);
 
@@ -414,12 +445,14 @@ export function useKeyboardShortcuts(handlers: GlobalShortcutHandlers) {
         handler: () => handlers.onNextProject?.(),
         priority: 'global',
         requiresClosed: true,
+        allowInInput: true,
       },
       {
         config: effectiveShortcuts.prevProject,
         handler: () => handlers.onPrevProject?.(),
         priority: 'global',
         requiresClosed: true,
+        allowInInput: true,
       },
       {
         config: effectiveShortcuts.newTask,
@@ -432,10 +465,18 @@ export function useKeyboardShortcuts(handlers: GlobalShortcutHandlers) {
         handler: () => handlers.onNextAgent?.(),
         priority: 'global',
         requiresClosed: true,
+        allowInInput: true,
       },
       {
         config: effectiveShortcuts.prevAgent,
         handler: () => handlers.onPrevAgent?.(),
+        priority: 'global',
+        requiresClosed: true,
+        allowInInput: true,
+      },
+      {
+        config: effectiveShortcuts.openInEditor,
+        handler: () => handlers.onOpenInEditor?.(),
         priority: 'global',
         requiresClosed: true,
       },
@@ -465,13 +506,22 @@ export function useKeyboardShortcuts(handlers: GlobalShortcutHandlers) {
         if (!matchesModifier(shortcut.config.modifier, event)) continue;
 
         // Skip non-command-palette shortcuts when typing in an input
-        if (isEditableTarget && !shortcut.isCommandPalette) continue;
+        if (isEditableTarget && !shortcut.isCommandPalette && !shortcut.allowInInput) continue;
 
-        // Handle priority and modal state
-        const isModalOpen = handlers.isCommandPaletteOpen || handlers.isSettingsOpen;
+        // Command palette is blocking; settings behaves like a page and should
+        // not force-close for global shortcuts.
+        const isCommandPaletteOpen = Boolean(handlers.isCommandPaletteOpen);
+        const hasClosableView = Boolean(
+          handlers.isCommandPaletteOpen ||
+            handlers.isSettingsOpen ||
+            handlers.isBrowserOpen ||
+            handlers.isDiffViewerOpen ||
+            handlers.isEditorOpen ||
+            handlers.isKanbanOpen
+        );
 
-        // Modal-priority shortcuts (like Escape) only work when modal is open
-        if (shortcut.priority === 'modal' && !isModalOpen) continue;
+        // Modal-priority shortcuts (like Escape) only work when a closable view is open
+        if (shortcut.priority === 'modal' && !hasClosableView) continue;
 
         // Global shortcuts
         if (shortcut.priority === 'global') {
@@ -482,16 +532,17 @@ export function useKeyboardShortcuts(handlers: GlobalShortcutHandlers) {
             return;
           }
 
-          // Other shortcuts: if modal is open and they can close it
-          if (isModalOpen && shortcut.requiresClosed) {
+          // Other shortcuts: if command palette is open and they can close it
+          if (isCommandPaletteOpen && shortcut.requiresClosed) {
             event.preventDefault();
             handlers.onCloseModal?.();
             setTimeout(() => shortcut.handler(), 100);
             return;
           }
 
-          // Normal execution when no modal is open
-          if (!isModalOpen) {
+          // Normal execution when command palette is not open.
+          // This keeps settings open while allowing global view shortcuts.
+          if (!isCommandPaletteOpen) {
             event.preventDefault();
             shortcut.handler();
             return;
@@ -505,6 +556,22 @@ export function useKeyboardShortcuts(handlers: GlobalShortcutHandlers) {
           return;
         }
       }
+
+      const agentTabIndex = getAgentTabSelectionIndex(event);
+      if (agentTabIndex === null) {
+        return;
+      }
+
+      const isCommandPaletteOpen = Boolean(handlers.isCommandPaletteOpen);
+      if (isCommandPaletteOpen) {
+        event.preventDefault();
+        handlers.onCloseModal?.();
+        setTimeout(() => handlers.onSelectAgentTab?.(agentTabIndex), 100);
+        return;
+      }
+
+      event.preventDefault();
+      handlers.onSelectAgentTab?.(agentTabIndex);
     };
 
     window.addEventListener('keydown', handleKeyDown, true);

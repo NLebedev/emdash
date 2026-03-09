@@ -1,115 +1,73 @@
 import React from 'react';
 import ChatInterface from './ChatInterface';
-import KanbanBoard from './kanban/KanbanBoard';
 import MultiAgentTask from './MultiAgentTask';
 import ProjectMainView from './ProjectMainView';
 import HomeView from './HomeView';
 import SkillsView from './skills/SkillsView';
-import SettingsPage from './SettingsPage';
+import { McpPage } from './mcp/McpPage';
+import { SettingsPage, type SettingsPageTab } from './SettingsPage';
+import TaskCreationLoading from './TaskCreationLoading';
 import TaskGridView from './TaskGridView';
-import type { Agent } from '../types';
-import type { Project, Task } from '../types/app';
-import type { SettingsPageTab } from '../hooks/useModalState';
+import { useProjectManagementContext } from '../contexts/ProjectManagementProvider';
+import { useTaskManagementContext } from '../contexts/TaskManagementContext';
+import { useProjectRemoteInfo } from '../hooks/useProjectRemoteInfo';
 
 interface MainContentAreaProps {
-  projects: Project[];
-  selectedProject: Project | null;
-  activeTask: Task | null;
-  activeTaskAgent: Agent | null;
-  showKanban: boolean;
-  showTaskGrid: boolean;
-  showHomeView: boolean;
-  showSkillsView: boolean;
   showSettingsPage: boolean;
   settingsPageInitialTab?: SettingsPageTab;
   handleCloseSettingsPage?: () => void;
-  projectDefaultBranch: string;
-  projectBranchOptions: Array<{ value: string; label: string }>;
-  isLoadingBranches: boolean;
-  setProjectDefaultBranch: (branch: string) => void;
-  handleSelectProject: (project: Project) => void;
-  handleSelectTask: (task: Task) => void;
-  handleDeleteTask: (
-    project: Project,
-    task: Task,
-    options?: { silent?: boolean }
-  ) => Promise<boolean>;
-  handleArchiveTask: (
-    project: Project,
-    task: Task,
-    options?: { silent?: boolean }
-  ) => Promise<boolean>;
-  handleDeleteProject: (project: Project) => Promise<void>;
-  handleOpenProject: () => void;
-  handleNewProjectClick: () => void;
-  handleCloneProjectClick: () => void;
-  handleAddRemoteProject: () => void;
-  setShowTaskModal: (show: boolean) => void;
-  setShowKanban: (show: boolean) => void;
-  setShowTaskGrid: (show: boolean) => void;
-  projectRemoteConnectionId?: string | null;
-  projectRemotePath?: string | null;
 }
 
 const MainContentArea: React.FC<MainContentAreaProps> = ({
-  projects,
-  selectedProject,
-  activeTask,
-  activeTaskAgent,
-  showKanban,
-  showTaskGrid,
-  showHomeView,
-  showSkillsView,
   showSettingsPage,
   settingsPageInitialTab,
   handleCloseSettingsPage,
-  projectDefaultBranch,
-  projectBranchOptions,
-  isLoadingBranches,
-  setProjectDefaultBranch,
-  handleSelectProject,
-  handleSelectTask,
-  handleDeleteTask,
-  handleArchiveTask,
-  handleDeleteProject,
-  handleOpenProject,
-  handleNewProjectClick,
-  handleCloneProjectClick,
-  handleAddRemoteProject,
-  setShowTaskModal,
-  setShowKanban,
-  setShowTaskGrid,
-  projectRemoteConnectionId,
-  projectRemotePath,
 }) => {
+  const { connectionId: projectRemoteConnectionId, remotePath: projectRemotePath } =
+    useProjectRemoteInfo();
+  const {
+    projects,
+    selectedProject,
+    showHomeView,
+    showSkillsView,
+    showMcpView,
+    showKanban,
+    setShowKanban,
+    showTaskGrid,
+    setShowTaskGrid,
+    projectDefaultBranch,
+    projectBranchOptions,
+    isLoadingBranches,
+    setProjectDefaultBranch,
+    handleDeleteProject,
+    handleOpenProject,
+    handleNewProjectClick,
+    handleCloneProjectClick,
+    handleAddRemoteProject,
+    handleSelectProject,
+  } = useProjectManagementContext();
+  const {
+    activeTask,
+    activeTaskAgent,
+    isCreatingTask,
+    handleTaskInterfaceReady: onTaskInterfaceReady,
+    openTaskModal,
+    handleSelectTask,
+    handleDeleteTask,
+    handleArchiveTask,
+    handleRestoreTask,
+    handleRenameTask: onRenameTask,
+  } = useTaskManagementContext();
+
   if (showSettingsPage) {
     return (
-      <div className="relative z-40 flex min-h-0 flex-1 overflow-hidden bg-background">
+      <div className="relative z-10 flex min-h-0 flex-1 overflow-hidden bg-background">
         <SettingsPage
           initialTab={settingsPageInitialTab}
           onClose={handleCloseSettingsPage || (() => {})}
         />
       </div>
     );
-  }
-
-  if (selectedProject && showKanban) {
-    return (
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <KanbanBoard
-          project={selectedProject}
-          onOpenTask={(ws: any) => {
-            handleSelectTask(ws);
-            setShowKanban(false);
-          }}
-          onCreateTask={() => setShowTaskModal(true)}
-        />
-      </div>
-    );
-  }
-
-  if (showSkillsView) {
-    return <SkillsView />;
   }
 
   if (showHomeView) {
@@ -123,6 +81,14 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
     );
   }
 
+  if (showSkillsView) {
+    return <SkillsView />;
+  }
+
+  if (showMcpView) {
+    return <McpPage />;
+  }
+
   if (selectedProject) {
     const singleView = activeTask ? (
       (activeTask.metadata as any)?.multiAgent?.enabled ? (
@@ -134,10 +100,12 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
           projectRemoteConnectionId={projectRemoteConnectionId}
           projectRemotePath={projectRemotePath}
           defaultBranch={projectDefaultBranch}
+          onTaskInterfaceReady={onTaskInterfaceReady}
         />
       ) : (
         <ChatInterface
           task={activeTask}
+          project={selectedProject}
           projectName={selectedProject.name}
           projectPath={selectedProject.path}
           projectRemoteConnectionId={projectRemoteConnectionId}
@@ -145,17 +113,20 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
           defaultBranch={projectDefaultBranch}
           className="min-h-0 flex-1"
           initialAgent={activeTaskAgent || undefined}
+          onTaskInterfaceReady={onTaskInterfaceReady}
+          onRenameTask={onRenameTask}
           fullWidth={!showTaskGrid}
         />
       )
     ) : (
       <ProjectMainView
         project={selectedProject}
-        onCreateTask={() => setShowTaskModal(true)}
+        onCreateTask={() => openTaskModal()}
         activeTask={activeTask}
         onSelectTask={handleSelectTask}
         onDeleteTask={handleDeleteTask}
         onArchiveTask={handleArchiveTask}
+        onRestoreTask={handleRestoreTask}
         onDeleteProject={handleDeleteProject}
         branchOptions={projectBranchOptions}
         isLoadingBranches={isLoadingBranches}
@@ -164,39 +135,54 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
     );
 
     return (
-      <TaskGridView
-        project={selectedProject}
-        projects={projects}
-        activeTask={activeTask}
-        isGridEnabled={showTaskGrid}
-        onGridEnabledChange={setShowTaskGrid}
-        singleView={singleView}
-        onSelectTaskInProject={(project, task) => {
-          if (selectedProject.id !== project.id) {
-            handleSelectProject(project);
-          }
-          handleSelectTask(task);
-        }}
-        onOpenTaskInProject={(project, task) => {
-          if (selectedProject.id !== project.id) {
-            handleSelectProject(project);
-          }
-          handleSelectTask(task);
-          setShowTaskGrid(false);
-        }}
-        onCreateTaskForProject={(project) => {
-          if (selectedProject.id !== project.id) {
-            handleSelectProject(project);
-          }
-          setShowTaskModal(true);
-        }}
-        projectRemoteConnectionId={projectRemoteConnectionId}
-        defaultBranch={projectDefaultBranch}
-      />
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+        <TaskGridView
+          project={selectedProject}
+          projects={projects}
+          activeTask={activeTask}
+          isGridEnabled={showTaskGrid}
+          onGridEnabledChange={setShowTaskGrid}
+          singleView={singleView}
+          onSelectTaskInProject={(project, task) => {
+            if (selectedProject.id !== project.id) {
+              handleSelectProject(project);
+            }
+            handleSelectTask(task);
+          }}
+          onOpenTaskInProject={(project, task) => {
+            if (selectedProject.id !== project.id) {
+              handleSelectProject(project);
+            }
+            handleSelectTask(task);
+            setShowTaskGrid(false);
+          }}
+          onCreateTaskForProject={(project) => {
+            if (selectedProject.id !== project.id) {
+              handleSelectProject(project);
+            }
+            openTaskModal();
+          }}
+          projectRemoteConnectionId={projectRemoteConnectionId}
+          defaultBranch={projectDefaultBranch}
+        />
+
+        {isCreatingTask && (
+          <div className="absolute inset-0 z-10 bg-background">
+            <TaskCreationLoading />
+          </div>
+        )}
+      </div>
     );
   }
 
-  return null;
+  return (
+    <div className="flex flex-1 items-center justify-center bg-background text-muted-foreground">
+      <div className="text-center">
+        <h3 className="text-lg font-medium">No project selected</h3>
+        <p className="mt-1">Select a project from the sidebar to get started.</p>
+      </div>
+    </div>
+  );
 };
 
 export default MainContentArea;

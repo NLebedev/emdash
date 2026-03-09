@@ -6,6 +6,8 @@ export type PlatformConfig = {
   checkCommands?: string[];
   bundleIds?: string[];
   appNames?: string[];
+  label?: string;
+  iconPath?: string;
 };
 
 type OpenInAppConfigShape = {
@@ -22,6 +24,8 @@ type OpenInAppConfigShape = {
 
 const ICON_PATHS = {
   finder: 'finder.png',
+  explorer: 'explorer.svg',
+  files: 'files.svg',
   cursor: 'cursor.svg',
   vscode: 'vscode.png',
   terminal: 'terminal.png',
@@ -33,6 +37,7 @@ const ICON_PATHS = {
   webstorm: 'webstorm.svg',
   pycharm: 'pycharm.svg',
   rustrover: 'rustrover.svg',
+  kiro: 'kiro.png',
 } as const;
 
 export const OPEN_IN_APPS: OpenInAppConfigShape[] = [
@@ -43,8 +48,16 @@ export const OPEN_IN_APPS: OpenInAppConfigShape[] = [
     alwaysAvailable: true,
     platforms: {
       darwin: { openCommands: ['open {{path}}'] },
-      win32: { openCommands: ['explorer {{path}}'] },
-      linux: { openCommands: ['xdg-open {{path}}'] },
+      win32: {
+        openCommands: ['explorer "{{path_raw}}"'],
+        label: 'Explorer',
+        iconPath: ICON_PATHS.explorer,
+      },
+      linux: {
+        openCommands: ['xdg-open {{path}}'],
+        label: 'Files',
+        iconPath: ICON_PATHS.files,
+      },
     },
   },
   {
@@ -56,10 +69,7 @@ export const OPEN_IN_APPS: OpenInAppConfigShape[] = [
     supportsRemote: true,
     platforms: {
       darwin: {
-        openCommands: [
-          'command -v cursor >/dev/null 2>&1 && cursor {{path}}',
-          'open -a "Cursor" {{path}}',
-        ],
+        openCommands: ['command -v cursor >/dev/null 2>&1 && cursor .', 'open -a "Cursor" .'],
         checkCommands: ['cursor'],
         appNames: ['Cursor'],
       },
@@ -187,6 +197,31 @@ export const OPEN_IN_APPS: OpenInAppConfigShape[] = [
     },
   },
   {
+    id: 'kiro',
+    label: 'Kiro',
+    iconPath: ICON_PATHS.kiro,
+    autoInstall: true,
+    platforms: {
+      darwin: {
+        openCommands: [
+          'command -v kiro >/dev/null 2>&1 && kiro {{path}}',
+          'open -a "Kiro" {{path}}',
+        ],
+        checkCommands: ['kiro'],
+        bundleIds: ['dev.kiro.desktop'],
+        appNames: ['Kiro'],
+      },
+      win32: {
+        openCommands: ['start "" kiro {{path}}'],
+        checkCommands: ['kiro'],
+      },
+      linux: {
+        openCommands: ['kiro {{path}}'],
+        checkCommands: ['kiro'],
+      },
+    },
+  },
+  {
     id: 'intellij-idea',
     label: 'IntelliJ IDEA',
     iconPath: ICON_PATHS['intellij-idea'],
@@ -282,4 +317,12 @@ export function getAppById(id: string): OpenInAppConfig | undefined {
 
 export function isValidOpenInAppId(value: unknown): value is OpenInAppId {
   return typeof value === 'string' && OPEN_IN_APPS.some((app) => app.id === value);
+}
+
+export function getResolvedLabel(app: OpenInAppConfigShape, platform: PlatformKey): string {
+  return app.platforms[platform]?.label || app.label;
+}
+
+export function getResolvedIconPath(app: OpenInAppConfigShape, platform: PlatformKey): string {
+  return app.platforms[platform]?.iconPath || app.iconPath;
 }

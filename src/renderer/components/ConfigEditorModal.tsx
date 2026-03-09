@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button } from './ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from './ui/dialog';
+import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Spinner } from './ui/spinner';
+import { Switch } from './ui/switch';
 import { Textarea } from './ui/textarea';
 
 type LifecycleScripts = {
@@ -14,12 +16,16 @@ type LifecycleScripts = {
 type ConfigShape = Record<string, unknown> & {
   preservePatterns?: string[];
   scripts?: Partial<LifecycleScripts>;
+  shellSetup?: string;
+  tmux?: boolean;
 };
 
 interface ConfigEditorModalProps {
   isOpen: boolean;
   onClose: () => void;
   projectPath: string;
+  isRemote?: boolean;
+  sshConnectionId?: string | null;
 }
 
 const EMPTY_SCRIPTS: LifecycleScripts = {
@@ -88,16 +94,35 @@ function applyPreservePatterns(config: ConfigShape, patterns: string[]): ConfigS
   };
 }
 
+function applyShellSetup(config: ConfigShape, shellSetup: string): ConfigShape {
+  const { shellSetup: _shellSetup, ...rest } = config;
+  const trimmed = shellSetup.trim();
+  if (!trimmed) return rest;
+  return { ...rest, shellSetup: trimmed };
+}
+
+function applyTmux(config: ConfigShape, tmux: boolean): ConfigShape {
+  const { tmux: _tmux, ...rest } = config;
+  if (!tmux) return rest;
+  return { ...rest, tmux: true };
+}
+
 export const ConfigEditorModal: React.FC<ConfigEditorModalProps> = ({
   isOpen,
   onClose,
   projectPath,
+  isRemote,
+  sshConnectionId,
 }) => {
   const [config, setConfig] = useState<ConfigShape>({});
   const [scripts, setScripts] = useState<LifecycleScripts>({ ...EMPTY_SCRIPTS });
   const [originalScripts, setOriginalScripts] = useState<LifecycleScripts>({ ...EMPTY_SCRIPTS });
   const [preservePatternsInput, setPreservePatternsInput] = useState('');
   const [originalPreservePatternsInput, setOriginalPreservePatternsInput] = useState('');
+  const [shellSetup, setShellSetup] = useState('');
+  const [originalShellSetup, setOriginalShellSetup] = useState('');
+  const [tmux, setTmux] = useState(false);
+  const [originalTmux, setOriginalTmux] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -114,25 +139,33 @@ export const ConfigEditorModal: React.FC<ConfigEditorModalProps> = ({
 
   const normalizedConfigContent = useMemo(() => {
     const withPatterns = applyPreservePatterns(config, preservePatterns);
-    const withScripts = applyScripts(withPatterns, scripts);
+    const withShellSetup = applyShellSetup(withPatterns, shellSetup);
+    const withTmux = applyTmux(withShellSetup, tmux);
+    const withScripts = applyScripts(withTmux, scripts);
     return `${JSON.stringify(withScripts, null, 2)}\n`;
-  }, [config, preservePatterns, scripts]);
+  }, [config, preservePatterns, shellSetup, tmux, scripts]);
 
   const scriptsDirty = useMemo(
     () =>
       scripts.setup !== originalScripts.setup ||
       scripts.run !== originalScripts.run ||
       scripts.teardown !== originalScripts.teardown ||
-      preservePatternsInput !== originalPreservePatternsInput,
+      preservePatternsInput !== originalPreservePatternsInput ||
+      shellSetup !== originalShellSetup ||
+      tmux !== originalTmux,
     [
+      originalShellSetup,
       originalPreservePatternsInput,
       originalScripts.run,
       originalScripts.setup,
       originalScripts.teardown,
+      originalTmux,
+      shellSetup,
       preservePatternsInput,
       scripts.run,
       scripts.setup,
       scripts.teardown,
+      tmux,
     ]
   );
 
@@ -143,31 +176,54 @@ export const ConfigEditorModal: React.FC<ConfigEditorModalProps> = ({
     setError(null);
     setLoadFailed(false);
     try {
-      const result = await window.electronAPI.getProjectConfig(projectPath);
-      if (!result.success || !result.content) {
-        throw new Error(result.error || 'Failed to load config');
+      let content: string;
+
+      if (isRemote && sshConnectionId) {
+        const configPath = `${projectPath}/.emdash.json`;
+        try {
+          content = await window.electronAPI.sshReadFile(sshConnectionId, configPath);
+        } catch {
+          // File doesn't exist yet on remote — treat as empty config
+          content = '{}';
+        }
+      } else {
+        const result = await window.electronAPI.getProjectConfig(projectPath);
+        if (!result.success || !result.content) {
+          throw new Error(result.error || 'Failed to load config');
+        }
+        content = result.content;
       }
 
-      const parsed = ensureConfigObject(JSON.parse(result.content));
+      const parsed = ensureConfigObject(JSON.parse(content));
       const nextScripts = scriptsFromConfig(parsed);
       const nextPreservePatterns = preservePatternsFromConfig(parsed);
+      const nextShellSetup = typeof parsed.shellSetup === 'string' ? parsed.shellSetup : '';
+      const nextTmux = parsed.tmux === true;
       setConfig(parsed);
       setScripts(nextScripts);
       setOriginalScripts(nextScripts);
       setPreservePatternsInput(nextPreservePatterns.join('\n'));
       setOriginalPreservePatternsInput(nextPreservePatterns.join('\n'));
+      setShellSetup(nextShellSetup);
+      setOriginalShellSetup(nextShellSetup);
+      setTmux(nextTmux);
+      setOriginalTmux(nextTmux);
     } catch (err) {
       setConfig({});
       setScripts({ ...EMPTY_SCRIPTS });
       setOriginalScripts({ ...EMPTY_SCRIPTS });
       setPreservePatternsInput('');
       setOriginalPreservePatternsInput('');
+      setShellSetup('');
+      setOriginalShellSetup('');
+      setTmux(false);
+      setOriginalTmux(false);
       setError(err instanceof Error ? err.message : 'Failed to load config');
       setLoadFailed(true);
     } finally {
       setIsLoading(false);
     }
-  }, [projectPath]);
+  }, [projectPath, isRemote, sshConnectionId]);
 
   useEffect(() => {
     if (!isOpen || !projectPath) return;
@@ -190,18 +246,31 @@ export const ConfigEditorModal: React.FC<ConfigEditorModalProps> = ({
     setIsSaving(true);
     setError(null);
     try {
-      const result = await window.electronAPI.saveProjectConfig(
-        projectPath,
-        normalizedConfigContent
-      );
-      if (!result.success) {
-        throw new Error(result.error || 'Failed to save config');
+      if (isRemote && sshConnectionId) {
+        const configPath = `${projectPath}/.emdash.json`;
+        await window.electronAPI.sshWriteFile(sshConnectionId, configPath, normalizedConfigContent);
+      } else {
+        const result = await window.electronAPI.saveProjectConfig(
+          projectPath,
+          normalizedConfigContent
+        );
+        if (!result.success) {
+          throw new Error(result.error || 'Failed to save config');
+        }
       }
 
-      const nextConfig = applyScripts(applyPreservePatterns(config, preservePatterns), scripts);
+      const nextConfig = applyScripts(
+        applyTmux(
+          applyShellSetup(applyPreservePatterns(config, preservePatterns), shellSetup),
+          tmux
+        ),
+        scripts
+      );
       setConfig(nextConfig);
       setOriginalScripts(scripts);
       setOriginalPreservePatternsInput(preservePatternsInput);
+      setOriginalShellSetup(shellSetup);
+      setOriginalTmux(tmux);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save config');
@@ -210,12 +279,16 @@ export const ConfigEditorModal: React.FC<ConfigEditorModalProps> = ({
     }
   }, [
     config,
+    isRemote,
     normalizedConfigContent,
     onClose,
+    shellSetup,
+    sshConnectionId,
     preservePatternsInput,
     preservePatterns,
     projectPath,
     scripts,
+    tmux,
   ]);
 
   return (
@@ -258,6 +331,42 @@ export const ConfigEditorModal: React.FC<ConfigEditorModalProps> = ({
                 <p className="text-xs text-muted-foreground">
                   Files copied to new tasks. One glob pattern per line.
                 </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="config-shell-setup">Shell setup</Label>
+                <Input
+                  id="config-shell-setup"
+                  value={shellSetup}
+                  onChange={(event) => {
+                    setShellSetup(event.target.value);
+                    setError(null);
+                  }}
+                  placeholder="No shell setup configured"
+                  className="font-mono text-xs"
+                  disabled={isSaving}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Runs in every terminal before the shell starts.
+                </p>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <Label htmlFor="config-tmux">tmux session persistence</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Wrap agent sessions in tmux so they survive disconnects and restarts.
+                  </p>
+                </div>
+                <Switch
+                  id="config-tmux"
+                  checked={tmux}
+                  onCheckedChange={(checked) => {
+                    setTmux(checked);
+                    setError(null);
+                  }}
+                  disabled={isSaving}
+                />
               </div>
 
               <div className="space-y-2">

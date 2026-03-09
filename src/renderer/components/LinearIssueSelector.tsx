@@ -2,11 +2,13 @@ import React, { useCallback, useEffect, useRef, useState, useMemo } from 'react'
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger } from './ui/select';
 import { Search } from 'lucide-react';
-import linearLogo from '../../assets/images/linear.png';
+import linearLogoSvg from '../../assets/images/Linear.svg?raw';
 import { type LinearIssueSummary } from '../types/linear';
 import { Separator } from './ui/separator';
 import { Spinner } from './ui/spinner';
 import { LinearIssuePreviewTooltip } from './LinearIssuePreviewTooltip';
+import { LinearStatusPill } from './LinearStatusPill';
+import AgentLogo from './AgentLogo';
 
 interface LinearIssueSelectorProps {
   selectedIssue: LinearIssueSummary | null;
@@ -236,7 +238,7 @@ export const LinearIssueSelector: React.FC<LinearIssueSelectorProps> = ({
   return (
     <div className={`min-w-0 max-w-full overflow-hidden ${className}`} style={{ maxWidth: '100%' }}>
       <Select
-        value={selectedIssue?.identifier || undefined}
+        value={selectedIssue?.identifier || '__clear__'}
         onValueChange={handleIssueSelect}
         disabled={isDisabled}
         open={dropdownOpen}
@@ -254,7 +256,11 @@ export const LinearIssueSelector: React.FC<LinearIssueSelectorProps> = ({
                     className="inline-flex items-center gap-1.5 rounded border border-border bg-muted px-1.5 py-0.5 dark:border-border dark:bg-card"
                     onClick={(e) => e.stopPropagation()}
                   >
-                    <img src={linearLogo} alt="Linear" className="h-3.5 w-3.5 dark:invert" />
+                    <AgentLogo
+                      logo={linearLogoSvg}
+                      alt="Linear"
+                      className="h-3.5 w-3.5 text-foreground"
+                    />
                     <span className="text-[11px] font-medium text-foreground">
                       {selectedIssue.identifier}
                     </span>
@@ -269,8 +275,19 @@ export const LinearIssueSelector: React.FC<LinearIssueSelectorProps> = ({
               </div>
             ) : (
               <>
-                <img src={linearLogo} alt="Linear" className="h-3.5 w-3.5 dark:invert" />
-                <span className="truncate text-muted-foreground">{issuePlaceholder}</span>
+                <AgentLogo
+                  logo={linearLogoSvg}
+                  alt="Linear"
+                  className="h-3.5 w-3.5 text-foreground"
+                />
+                {isLoadingIssues ? (
+                  <>
+                    <span className="truncate text-muted-foreground">Loading Linear issues</span>
+                    <Spinner size="sm" />
+                  </>
+                ) : (
+                  <span className="truncate text-muted-foreground">{issuePlaceholder}</span>
+                )}
               </>
             )}
           </div>
@@ -302,13 +319,18 @@ export const LinearIssueSelector: React.FC<LinearIssueSelectorProps> = ({
                   <SelectItem value={issue.identifier}>
                     <span className="flex min-w-0 items-center gap-2">
                       <span className="inline-flex shrink-0 items-center gap-1.5 rounded border border-border bg-muted px-1.5 py-0.5 dark:border-border dark:bg-card">
-                        <img src={linearLogo} alt="Linear" className="h-3.5 w-3.5 dark:invert" />
+                        <AgentLogo
+                          logo={linearLogoSvg}
+                          alt="Linear"
+                          className="h-3.5 w-3.5 text-foreground"
+                        />
                         <span className="text-[11px] font-medium text-foreground">
                           {issue.identifier}
                         </span>
                       </span>
+                      <LinearStatusPill state={issue.state} />
                       {issue.title ? (
-                        <span className="ml-2 truncate text-muted-foreground">{issue.title}</span>
+                        <span className="truncate text-muted-foreground">{issue.title}</span>
                       ) : null}
                     </span>
                   </SelectItem>

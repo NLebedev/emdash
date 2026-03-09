@@ -268,7 +268,12 @@ describe('TaskLifecycleService', () => {
     const taskPath = '/tmp/wt-8';
     const projectPath = '/tmp/project';
 
-    const setupPromise = taskLifecycleService.runSetup(taskId, taskPath, projectPath);
+    const setupPromise = taskLifecycleService
+      .runSetup(taskId, taskPath, projectPath)
+      .catch((err) => ({
+        ok: false,
+        error: err.message,
+      }));
     await new Promise((resolve) => setTimeout(resolve, 25));
     child.emit('error', new Error('spawn failed'));
     child.emit('exit', 0);

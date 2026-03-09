@@ -1,9 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { ExternalLink, X } from 'lucide-react';
 import { Separator } from './ui/separator';
-import type { SettingsPageTab } from '../hooks/useModalState';
 import type { CliAgentStatus } from '../types/connections';
-import { BASE_CLI_AGENTS } from './CliAgentsList';
+import { BASE_CLI_AGENTS, CliAgentsList } from './CliAgentsList';
 import { Button } from './ui/button';
 
 // Import existing settings cards
@@ -11,17 +10,30 @@ import TelemetryCard from './TelemetryCard';
 import NotificationSettingsCard from './NotificationSettingsCard';
 import { UpdateCard } from './UpdateCard';
 import DefaultAgentSettingsCard from './DefaultAgentSettingsCard';
-import { AutoApproveByDefaultRow, AutoGenerateTaskNamesRow } from './TaskSettingsRows';
+import {
+  AutoApproveByDefaultRow,
+  AutoGenerateTaskNamesRow,
+  CreateWorktreeByDefaultRow,
+  AutoTrustWorktreesRow,
+} from './TaskSettingsRows';
 import IntegrationsCard from './IntegrationsCard';
-import Context7SettingsCard from './Context7SettingsCard';
 import RepositorySettingsCard from './RepositorySettingsCard';
 import ThemeCard from './ThemeCard';
 import KeyboardSettingsCard from './KeyboardSettingsCard';
 import RightSidebarSettingsCard from './RightSidebarSettingsCard';
 import BrowserPreviewSettingsCard from './BrowserPreviewSettingsCard';
+import TaskHoverActionCard from './TaskHoverActionCard';
 import TerminalSettingsCard from './TerminalSettingsCard';
-import CliAgentsList from './CliAgentsList';
+import HiddenToolsSettingsCard from './HiddenToolsSettingsCard';
 import { useTaskSettings } from '../hooks/useTaskSettings';
+
+export type SettingsPageTab =
+  | 'general'
+  | 'clis-models'
+  | 'integrations'
+  | 'repository'
+  | 'interface'
+  | 'docs';
 
 // Helper functions from SettingsModal
 const createDefaultCliAgents = (): CliAgentStatus[] =>
@@ -83,7 +95,7 @@ interface SectionConfig {
   component: React.ReactNode;
 }
 
-const SettingsPage: React.FC<SettingsPageProps> = ({ initialTab, onClose }) => {
+export const SettingsPage: React.FC<SettingsPageProps> = ({ initialTab, onClose }) => {
   const [activeTab, setActiveTab] = useState<SettingsPageTab>(initialTab || 'general');
   const [cliAgents, setCliAgents] = useState<CliAgentStatus[]>(() => createDefaultCliAgents());
   const taskSettings = useTaskSettings();
@@ -189,6 +201,12 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ initialTab, onClose }) => {
           component: <AutoApproveByDefaultRow taskSettings={taskSettings} />,
         },
         {
+          component: <CreateWorktreeByDefaultRow taskSettings={taskSettings} />,
+        },
+        {
+          component: <AutoTrustWorktreesRow taskSettings={taskSettings} />,
+        },
+        {
           component: <NotificationSettingsCard />,
         },
         {
@@ -214,10 +232,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ initialTab, onClose }) => {
     integrations: {
       title: 'Integrations',
       description: 'Connect external services and tools.',
-      sections: [
-        { title: 'Integrations', component: <IntegrationsCard /> },
-        { title: 'MCP Server', component: <Context7SettingsCard /> },
-      ],
+      sections: [{ title: 'Integrations', component: <IntegrationsCard /> }],
     },
     repository: {
       title: 'Repository',
@@ -237,8 +252,13 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ initialTab, onClose }) => {
             <div className="flex flex-col gap-8 rounded-xl border border-muted p-4">
               <RightSidebarSettingsCard />
               <BrowserPreviewSettingsCard />
+              <TaskHoverActionCard />
             </div>
           ),
+        },
+        {
+          title: 'Tools',
+          component: <HiddenToolsSettingsCard />,
         },
       ],
     },
@@ -247,92 +267,94 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ initialTab, onClose }) => {
   const currentContent = tabContent[activeTab as keyof typeof tabContent];
 
   return (
-    <div className="flex h-full min-w-[720px] flex-col gap-6 overflow-hidden px-6 pb-0 pt-8">
-      {/* Header */}
-      <div className="flex flex-col gap-6 px-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="flex flex-col gap-1.5">
-            <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
-            <p className="text-sm text-muted-foreground">
-              Manage your account settings and set preferences.
-            </p>
-          </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            onClick={onClose}
-            className="h-8 w-8"
-            aria-label="Close settings"
-          >
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
-        <Separator />
-      </div>
-
-      {/* Contents: Navigation + Content */}
-      <div className="flex min-h-0 flex-1 gap-8 overflow-hidden pr-32">
-        {/* Navigation menu */}
-        <nav className="flex w-[215px] flex-col gap-2">
-          {tabs.map((tab) => {
-            const isActive = activeTab === tab.id && !tab.isExternal;
-
-            return (
-              <button
-                key={tab.id}
-                type="button"
-                onClick={() => {
-                  if (tab.isExternal) {
-                    handleDocsClick();
-                  } else {
-                    setActiveTab(tab.id as SettingsPageTab);
-                  }
-                }}
-                className={`flex w-full items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-                  isActive
-                    ? 'bg-muted text-foreground'
-                    : tab.isExternal
-                      ? 'text-muted-foreground hover:bg-muted/60'
-                      : 'text-foreground hover:bg-muted/60'
-                }`}
-              >
-                <span className="text-left">{tab.label}</span>
-                {tab.isExternal && <ExternalLink className="h-4 w-4" />}
-              </button>
-            );
-          })}
-        </nav>
-
-        {/* Content container */}
-        {currentContent && (
-          <div className="flex min-h-0 flex-1 flex-col gap-8 overflow-y-auto pb-8">
-            {/* Page title */}
-            <div className="flex flex-col gap-6">
-              <div className="flex flex-col gap-1">
-                <h2 className="text-base font-medium">{currentContent.title}</h2>
-                <p className="text-sm text-muted-foreground">{currentContent.description}</p>
-              </div>
-              <Separator />
+    <div className="flex h-full min-h-0 w-full flex-1 flex-col overflow-hidden px-6 pb-0 pt-8">
+      <div className="mx-auto flex h-full min-h-0 w-full max-w-[1060px] flex-col gap-6">
+        {/* Header */}
+        <div className="flex flex-col gap-6">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex flex-col gap-1.5">
+              <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+              <p className="text-sm text-muted-foreground">
+                Manage your account settings and set preferences.
+              </p>
             </div>
-
-            {/* Sections */}
-            {currentContent.sections.map((section, index) => (
-              <div key={index} className="flex flex-col gap-3">
-                {section.title && (
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-medium text-foreground">{section.title}</h3>
-                    {section.action && <div>{section.action}</div>}
-                  </div>
-                )}
-                {section.component}
-              </div>
-            ))}
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              onClick={onClose}
+              className="h-8 w-8"
+              aria-label="Close settings"
+            >
+              <X className="h-4 w-4" />
+            </Button>
           </div>
-        )}
+          <Separator />
+        </div>
+
+        {/* Contents: Navigation + Content */}
+        <div className="grid min-h-0 flex-1 grid-cols-[13rem_minmax(0,1fr)] gap-8 overflow-hidden">
+          {/* Navigation menu */}
+          <nav className="flex min-h-0 w-52 flex-col gap-2 overflow-y-auto">
+            {tabs.map((tab) => {
+              const isActive = activeTab === tab.id && !tab.isExternal;
+
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    if (tab.isExternal) {
+                      handleDocsClick();
+                    } else {
+                      setActiveTab(tab.id as SettingsPageTab);
+                    }
+                  }}
+                  className={`flex w-full items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+                    isActive
+                      ? 'bg-muted text-foreground'
+                      : tab.isExternal
+                        ? 'text-muted-foreground hover:bg-muted/60'
+                        : 'text-foreground hover:bg-muted/60'
+                  }`}
+                >
+                  <span className="text-left">{tab.label}</span>
+                  {tab.isExternal && <ExternalLink className="h-4 w-4" />}
+                </button>
+              );
+            })}
+          </nav>
+
+          {/* Content container */}
+          {currentContent && (
+            <div className="flex min-h-0 min-w-0 flex-1 justify-center overflow-y-auto pb-8">
+              <div className="mx-auto w-full max-w-4xl space-y-8">
+                {/* Page title */}
+                <div className="flex flex-col gap-6">
+                  <div className="flex flex-col gap-1">
+                    <h2 className="text-base font-medium">{currentContent.title}</h2>
+                    <p className="text-sm text-muted-foreground">{currentContent.description}</p>
+                  </div>
+                  <Separator />
+                </div>
+
+                {/* Sections */}
+                {currentContent.sections.map((section, index) => (
+                  <div key={index} className="flex flex-col gap-3">
+                    {section.title && (
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-sm font-medium text-foreground">{section.title}</h3>
+                        {section.action && <div>{section.action}</div>}
+                      </div>
+                    )}
+                    {section.component}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 };
-
-export default SettingsPage;

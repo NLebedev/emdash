@@ -17,6 +17,7 @@ import { extractDroppedFilePaths, hasFilesInDataTransfer } from '../lib/dndFileP
 import { agentMeta } from '../providers/meta';
 import type { Project, Task } from '../types/app';
 import { type Conversation } from '../../main/services/DatabaseService';
+import { rpc } from '@/lib/rpc';
 
 const CONVERSATIONS_CHANGED_EVENT = 'emdash:conversations-changed';
 const GRID_SLOT_OPTIONS = [2, 4, 6, 9] as const;
@@ -158,7 +159,9 @@ const resolveConversationProvider = (
   conversation: Pick<Conversation, 'provider'> | null | undefined,
   fallbackProvider: ProviderId
 ): ProviderId => {
-  return isProviderId(conversation?.provider) ? conversation.provider : fallbackProvider;
+  return isProviderId(conversation?.provider)
+    ? (conversation.provider as ProviderId)
+    : fallbackProvider;
 };
 
 const buildTargetFromConversation = (
@@ -177,14 +180,21 @@ const buildTargetFromConversation = (
 };
 
 const loadConversationsForTask = async (taskId: string): Promise<Conversation[]> => {
-  const result = await window.electronAPI.getConversations(taskId);
-  if (result?.success && Array.isArray(result.conversations) && result.conversations.length > 0) {
-    return sortConversations(result.conversations as Conversation[]);
-  }
+  try {
+    const conversations = await rpc.db.getConversations(taskId);
+    if (conversations && Array.isArray(conversations) && conversations.length > 0) {
+      return sortConversations(conversations as Conversation[]);
+    }
 
-  const defaultResult = await window.electronAPI.getOrCreateDefaultConversation(taskId);
-  if (defaultResult?.success && defaultResult.conversation) {
-    return [defaultResult.conversation as Conversation];
+    const defaultConversation = await rpc.db.getOrCreateDefaultConversation({
+      taskId,
+      provider: 'claude',
+    });
+    if (defaultConversation) {
+      return [defaultConversation as Conversation];
+    }
+  } catch (error) {
+    console.error('Failed to load conversations for grid task', error);
   }
 
   return [];
@@ -350,7 +360,7 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
 
       if (nextActiveConversation && !nextActiveConversation.isActive) {
         try {
-          await window.electronAPI.setActiveConversation({
+          await rpc.db.setActiveConversation({
             taskId,
             conversationId: nextActiveConversation.id,
           });
@@ -452,7 +462,7 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
     if (!selectedConversation) return;
 
     try {
-      await window.electronAPI.setActiveConversation({ taskId, conversationId });
+      await rpc.db.setActiveConversation({ taskId, conversationId });
     } catch {
       // Ignore DB sync failures and still switch locally.
     }
@@ -469,12 +479,13 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
 
   const handleCreateChat = async (title: string, newAgent: string) => {
     try {
-      const result = await window.electronAPI.createConversation({
+      const result = await rpc.db.createConversation({
         taskId,
         title,
         provider: newAgent,
+        isMain: false,
       });
-      if (!result?.success) return;
+      if (!result) return;
 
       await reloadConversations();
       try {
@@ -502,7 +513,10 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
     const totalByProvider = new Map<ProviderId, number>();
     for (const conversation of sortedConversations) {
       const conversationProvider = resolveConversationProvider(conversation, fallbackProvider);
-      totalByProvider.set(conversationProvider, (totalByProvider.get(conversationProvider) || 0) + 1);
+      totalByProvider.set(
+        conversationProvider,
+        (totalByProvider.get(conversationProvider) || 0) + 1
+      );
     }
 
     const seenByProvider = new Map<ProviderId, number>();
@@ -567,6 +581,8 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
 
     onDropSlot(slotIndex);
   };
+
+  const isDark = effectiveTheme === 'dark' || effectiveTheme === 'dark-black';
 
   return (
     <section
@@ -731,11 +747,9 @@ const TaskTerminalTile: React.FC<TaskTerminalTileProps> = ({
             providerId={target.provider}
             autoApprove={autoApproveEnabled}
             env={taskEnv}
-            keepAlive
             mapShiftEnterToCtrlJ
-            variant={
-              effectiveTheme === 'dark' || effectiveTheme === 'dark-black' ? 'dark' : 'light'
-            }
+            variant={isDark ? 'dark' : 'light'}
+            themeOverride={{ base: isDark ? 'dark' : 'light' }}
             className="h-full w-full"
           />
         ) : (
@@ -845,20 +859,17 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
 
   useEffect(() => {
     let cancelled = false;
-    const getProviderStatuses = window.electronAPI.getProviderStatuses;
-    if (!getProviderStatuses) {
-      return () => {
-        cancelled = true;
-      };
-    }
 
     const loadInstalledAgents = async () => {
       try {
-        const result = await getProviderStatuses();
-        if (cancelled) return;
-        if (!result?.success || !result.statuses) return;
+        const getProviderStatuses = window.electronAPI.getProviderStatuses;
+        if (typeof getProviderStatuses !== 'function') return;
 
-        const statuses = result.statuses as Record<string, { installed?: boolean } | undefined>;
+        const res = await getProviderStatuses();
+        if (cancelled) return;
+        if (!res?.success || !res.statuses) return;
+
+        const statuses = res.statuses as Record<string, { installed?: boolean } | undefined>;
         const nextInstalled = Object.entries(statuses)
           .filter(([, status]) => status?.installed === true)
           .map(([providerId]) => providerId);
@@ -1285,11 +1296,11 @@ const TaskGridView: React.FC<TaskGridViewProps> = ({
       {!isGridEnabled ? <div className="min-h-0 flex-1 overflow-hidden">{singleView}</div> : null}
 
       {isGridEnabled ? (
-        <div className="min-h-0 flex flex-1 flex-col overflow-hidden">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <div
             ref={gridSurfaceRef}
             className={cn(
-              'relative min-h-0 flex-1 w-full overflow-hidden bg-background',
+              'relative min-h-0 w-full flex-1 overflow-hidden bg-background',
               pageCount > 1 ? '' : 'border-b border-border'
             )}
           >

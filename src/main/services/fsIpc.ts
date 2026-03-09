@@ -7,6 +7,7 @@ import { DEFAULT_IGNORES } from '../utils/fsIgnores';
 import { safeStat } from '../utils/safeStat';
 import { sshService } from './ssh/SshService';
 import { RemoteFileSystem } from './fs/RemoteFileSystem';
+import { GitIgnoreParser } from '../utils/gitIgnore';
 
 const DEFAULT_EMDASH_CONFIG = `{
   "preservePatterns": [
@@ -41,6 +42,7 @@ function createRemoteFs(args: { connectionId: string; remotePath: string }): Rem
 type ListArgs = {
   root: string;
   includeDirs?: boolean;
+  recursive?: boolean;
   maxEntries?: number;
   timeBudgetMs?: number;
 } & RemoteParams;
@@ -166,6 +168,7 @@ export function registerFsIpc(): void {
           taskId: requestId,
           root,
           includeDirs,
+          recursive: args.recursive !== false, // Default to true if not specified
           maxEntries,
           timeBudgetMs,
           batchSize: DEFAULT_BATCH_SIZE,
@@ -327,9 +330,9 @@ export function registerFsIpc(): void {
 
   // Constants for search functionality
   const SEARCH_PREVIEW_CONTEXT_LENGTH = 30;
-  const DEFAULT_MAX_SEARCH_RESULTS = 100; // Increased back for better coverage
+  const DEFAULT_MAX_SEARCH_RESULTS = 10000; // Increased for comprehensive search results
   const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB max file size
-  const MAX_SEARCH_FILES = 5000; // Increased to search more files
+  const MAX_SEARCH_FILES = 20000; // Increased to search more files
   const BINARY_CHECK_BYTES = 512; // Check first 512 bytes for binary content (faster)
 
   // Extended ignore patterns for performance
@@ -500,6 +503,15 @@ export function registerFsIpc(): void {
         if (!query || query.length < 2)
           return { success: false, error: 'Query too short (min 2 chars)' };
 
+        let gitIgnore: GitIgnoreParser | undefined;
+        try {
+          const gitIgnorePath = path.join(root, '.gitignore');
+          const content = await fs.promises.readFile(gitIgnorePath, 'utf8');
+          gitIgnore = new GitIgnoreParser(content);
+        } catch {
+          // Ignore error reading .gitignore
+        }
+
         const results: Array<{
           file: string;
           matches: Array<{
@@ -616,6 +628,11 @@ export function registerFsIpc(): void {
               const fullPath = path.join(dirPath, entry.name);
 
               if (entry.isDirectory()) {
+                const relPath = path.relative(root, fullPath);
+                if (gitIgnore && (gitIgnore.ignores(relPath) || gitIgnore.ignores(relPath + '/'))) {
+                  continue;
+                }
+
                 if (!SEARCH_IGNORES.has(entry.name)) {
                   await collectFiles(fullPath, files);
                 }

@@ -28,6 +28,7 @@ import { MarkdownPreview } from './MarkdownPreview';
 import '@/styles/editor-diff.css';
 
 interface CodeEditorProps {
+  taskId: string;
   taskPath: string;
   taskName: string;
   projectName: string;
@@ -37,6 +38,7 @@ interface CodeEditorProps {
 }
 
 export default function CodeEditor({
+  taskId,
   taskPath,
   taskName,
   projectName,
@@ -63,7 +65,7 @@ export default function CodeEditor({
     closeFile,
     updateFileContent,
     setActiveFile,
-  } = useFileManager({ taskPath, connectionId, remotePath });
+  } = useFileManager({ taskId, taskPath, connectionId, remotePath });
 
   // Get file changes status from git
   const { fileChanges } = useFileChanges(taskPath);
@@ -279,6 +281,7 @@ export default function CodeEditor({
 
       <div className="flex flex-1 overflow-hidden">
         <FileExplorer
+          taskId={taskId}
           taskPath={taskPath}
           taskName={taskName}
           projectName={projectName}
@@ -310,6 +313,7 @@ export default function CodeEditor({
             onEditorChange={handleEditorChange}
             isPreviewActive={isPreviewActive}
             modelRootPath={modelRootPath}
+            taskPath={taskPath}
           />
         </div>
       </div>
@@ -318,6 +322,7 @@ export default function CodeEditor({
 }
 
 interface FileExplorerProps {
+  taskId: string;
   taskPath: string;
   taskName: string;
   projectName: string;
@@ -333,6 +338,7 @@ interface FileExplorerProps {
 }
 
 const FileExplorer: React.FC<FileExplorerProps> = ({
+  taskId,
   taskPath,
   taskName,
   projectName,
@@ -360,12 +366,13 @@ const FileExplorer: React.FC<FileExplorerProps> = ({
 
       <div className="flex flex-1 flex-col overflow-hidden">
         <FileTree
+          taskId={taskId}
           rootPath={taskPath}
           selectedFile={selectedFile}
           onSelectFile={onSelectFile}
           onOpenFile={onOpenFile}
           className="flex-1 overflow-y-auto"
-          showHiddenFiles={false}
+          showHiddenFiles={true}
           excludePatterns={DEFAULT_EXCLUDE_PATTERNS}
           fileChanges={fileChanges}
           connectionId={connectionId}
@@ -402,6 +409,7 @@ interface EditorContentProps {
   onEditorChange: (value: string | undefined) => void;
   isPreviewActive: boolean;
   modelRootPath: string;
+  taskPath: string;
 }
 
 const EditorContent: React.FC<EditorContentProps> = ({
@@ -411,6 +419,7 @@ const EditorContent: React.FC<EditorContentProps> = ({
   onEditorChange,
   isPreviewActive,
   modelRootPath,
+  taskPath,
 }) => {
   if (!activeFile) {
     return <NoFileOpen />;
@@ -425,7 +434,10 @@ const EditorContent: React.FC<EditorContentProps> = ({
   }
 
   if (isPreviewActive) {
-    return <MarkdownPreview content={activeFile.content} />;
+    const fileDir = activeFile.path.includes('/')
+      ? activeFile.path.substring(0, activeFile.path.lastIndexOf('/'))
+      : '';
+    return <MarkdownPreview content={activeFile.content} rootPath={taskPath} fileDir={fileDir} />;
   }
 
   return (

@@ -1,8 +1,8 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
-import rehypeSanitize from 'rehype-sanitize';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { useTheme } from '@/hooks/useTheme';
@@ -14,9 +14,68 @@ interface MarkdownRendererProps {
   content: string;
   variant?: Variant;
   className?: string;
+  /** Root path for resolving relative image paths (e.g. taskPath / worktree root) */
+  rootPath?: string;
+  /** Directory of the markdown file, relative to rootPath */
+  fileDir?: string;
 }
 
-function useFullComponents(isDark: boolean) {
+/** Sanitize schema that also allows data: URIs on images */
+const sanitizeSchema = {
+  ...defaultSchema,
+  protocols: {
+    ...defaultSchema.protocols,
+    src: [...(defaultSchema.protocols?.src || []), 'data'],
+  },
+};
+
+/** Resolves a local image src via fsReadImage and renders as base64 data URI */
+const ResolvedImage: React.FC<{ src: string; alt: string; rootPath: string; fileDir: string }> = ({
+  src,
+  alt,
+  rootPath,
+  fileDir,
+}) => {
+  const [dataUrl, setDataUrl] = useState<string | null>(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const relPath = fileDir ? `${fileDir}/${src}` : src;
+    window.electronAPI
+      .fsReadImage(rootPath, relPath)
+      .then((result: any) => {
+        if (cancelled) return;
+        if (result.success && result.dataUrl) {
+          setDataUrl(result.dataUrl);
+        } else {
+          setError(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [src, rootPath, fileDir]);
+
+  if (error) {
+    return (
+      <span className="my-3 inline-block text-xs text-muted-foreground">
+        [Image not found: {src}]
+      </span>
+    );
+  }
+  if (!dataUrl) {
+    return (
+      <span className="my-3 inline-block text-xs text-muted-foreground">Loading image...</span>
+    );
+  }
+  return <img src={dataUrl} alt={alt} className="my-3 max-w-full rounded" />;
+};
+
+function useFullComponents(isDark: boolean, rootPath?: string, fileDir?: string) {
   return useMemo(
     () => ({
       h1: ({ children }: any) => (
@@ -74,16 +133,26 @@ function useFullComponents(isDark: boolean) {
       pre: ({ children }: any) => (
         <pre className="mb-3 overflow-x-auto rounded-md border border-border">{children}</pre>
       ),
-      a: ({ href, children }: any) => (
-        <a
-          href={href}
-          className="text-primary underline decoration-primary/50 hover:decoration-primary"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          {children}
-        </a>
-      ),
+      a: ({ href, children }: any) => {
+        const isHttp = typeof href === 'string' && /^https?:\/\//i.test(href);
+        const handleClick = (e: React.MouseEvent) => {
+          if (isHttp && typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+            e.preventDefault();
+            window.electronAPI.openExternal(href).catch(() => {});
+          }
+        };
+        return (
+          <a
+            href={href}
+            className="text-primary underline decoration-primary/50 hover:decoration-primary"
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={handleClick}
+          >
+            {children}
+          </a>
+        );
+      },
       blockquote: ({ children }: any) => (
         <blockquote className="mb-3 border-l-4 border-border bg-muted/30 py-1 pl-4 text-sm italic text-muted-foreground">
           {children}
@@ -104,9 +173,15 @@ function useFullComponents(isDark: boolean) {
         <td className="border-t border-border px-3 py-2 text-foreground">{children}</td>
       ),
       hr: () => <hr className="my-6 border-border" />,
-      img: ({ src, alt }: any) => (
-        <img src={src} alt={alt || ''} className="my-3 max-w-full rounded" />
-      ),
+      img: ({ src, alt }: any) => {
+        const isExternal = typeof src === 'string' && /^https?:\/\//i.test(src);
+        if (!isExternal && rootPath && src) {
+          return (
+            <ResolvedImage src={src} alt={alt || ''} rootPath={rootPath} fileDir={fileDir || ''} />
+          );
+        }
+        return <img src={src} alt={alt || ''} className="my-3 max-w-full rounded" />;
+      },
       strong: ({ children }: any) => (
         <strong className="font-semibold text-foreground">{children}</strong>
       ),
@@ -120,7 +195,7 @@ function useFullComponents(isDark: boolean) {
         />
       ),
     }),
-    [isDark]
+    [isDark, rootPath, fileDir]
   );
 }
 
@@ -154,11 +229,26 @@ function useCompactComponents() {
       strong: ({ children }: any) => (
         <strong className="font-semibold text-foreground">{children}</strong>
       ),
-      a: ({ href, children }: any) => (
-        <a href={href} className="text-primary underline" target="_blank" rel="noopener noreferrer">
-          {children}
-        </a>
-      ),
+      a: ({ href, children }: any) => {
+        const isHttp = typeof href === 'string' && /^https?:\/\//i.test(href);
+        const handleClick = (e: React.MouseEvent) => {
+          if (isHttp && typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+            e.preventDefault();
+            window.electronAPI.openExternal(href).catch(() => {});
+          }
+        };
+        return (
+          <a
+            href={href}
+            className="text-primary underline"
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={handleClick}
+          >
+            {children}
+          </a>
+        );
+      },
     }),
     []
   );
@@ -168,15 +258,20 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   content,
   variant = 'full',
   className,
+  rootPath,
+  fileDir,
 }) => {
   const { effectiveTheme } = useTheme();
   const isDark = effectiveTheme === 'dark' || effectiveTheme === 'dark-black';
 
-  const fullComponents = useFullComponents(isDark);
+  const fullComponents = useFullComponents(isDark, rootPath, fileDir);
   const compactComponents = useCompactComponents();
 
   const components = variant === 'full' ? fullComponents : compactComponents;
-  const rehypePlugins = variant === 'full' ? [rehypeRaw, rehypeSanitize] : [rehypeSanitize];
+  const rehypePlugins =
+    variant === 'full'
+      ? [rehypeRaw, [rehypeSanitize, sanitizeSchema] as any]
+      : [[rehypeSanitize, sanitizeSchema] as any];
 
   return (
     <div className={cn(className)}>

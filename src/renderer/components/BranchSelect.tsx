@@ -40,10 +40,12 @@ interface BranchSelectProps {
   placeholder?: string;
   variant?: BranchSelectVariant;
   onOpenChange?: (open: boolean) => void;
+  icon?: React.ReactNode;
 }
 
 const ROW_HEIGHT = 32;
 const MAX_LIST_HEIGHT = 256;
+const EMPTY_BRANCH_VALUE = '__branch_select_empty__';
 
 const BranchSelect: React.FC<BranchSelectProps> = ({
   value,
@@ -54,6 +56,7 @@ const BranchSelect: React.FC<BranchSelectProps> = ({
   placeholder,
   variant = 'default',
   onOpenChange,
+  icon,
 }) => {
   const [open, setOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -103,6 +106,8 @@ const BranchSelect: React.FC<BranchSelectProps> = ({
 
   const defaultPlaceholder = isLoading ? 'Loading...' : 'Select branch';
   const triggerPlaceholder = placeholder ?? defaultPlaceholder;
+  const hasKnownSelection = Boolean(value && options.some((option) => option.value === value));
+  const selectedValue = hasKnownSelection ? (value as string) : EMPTY_BRANCH_VALUE;
 
   const triggerClassName =
     variant === 'ghost'
@@ -111,19 +116,23 @@ const BranchSelect: React.FC<BranchSelectProps> = ({
 
   return (
     <Select
-      value={options.length === 0 ? undefined : value}
+      value={selectedValue}
       onValueChange={onValueChange}
       disabled={disabled || isLoading || options.length === 0}
       open={open}
       onOpenChange={handleOpenChange}
     >
       <SelectTrigger className={triggerClassName}>
+        {icon}
         <SelectValue placeholder={triggerPlaceholder} />
       </SelectTrigger>
       <SelectContent
         className="[&>[data-radix-select-scroll-down-button]]:hidden [&>[data-radix-select-scroll-up-button]]:hidden"
-        style={{ minWidth: variant === 'ghost' ? '200px' : 'var(--radix-select-trigger-width)' }}
+        style={{ minWidth: '320px' }}
       >
+        <SelectItem value={EMPTY_BRANCH_VALUE} disabled className="hidden">
+          {triggerPlaceholder}
+        </SelectItem>
         <div className="px-2 pb-2 pt-2" onPointerDown={(event) => event.stopPropagation()}>
           <Input
             ref={searchInputRef}
@@ -135,7 +144,7 @@ const BranchSelect: React.FC<BranchSelectProps> = ({
               }
             }}
             placeholder="Search branches"
-            className="h-7 bg-popover px-2 py-1 text-xs"
+            className="bg-popover px-2 py-1 text-sm"
           />
         </div>
         <ScrollArea

@@ -2,6 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const providerStatusGetMock = vi.fn();
 const getProviderCustomConfigMock = vi.fn();
+const fsReadFileSyncMock = vi.fn();
+const fsExistsSyncMock = vi.fn();
+const fsWriteFileSyncMock = vi.fn();
+const fsMkdirSyncMock = vi.fn();
+const fsStatSyncMock = vi.fn();
+const fsAccessSyncMock = vi.fn();
+const fsReaddirSyncMock = vi.fn();
+const agentEventGetPortMock = vi.fn(() => 0);
+const agentEventGetTokenMock = vi.fn(() => '');
 
 vi.mock('../../main/services/providerStatusCache', () => ({
   providerStatusCache: {
@@ -29,6 +38,33 @@ vi.mock('../../main/errorTracking', () => ({
   },
 }));
 
+vi.mock('fs', () => {
+  const fsMock = {
+    readFileSync: (...args: any[]) => fsReadFileSyncMock(...args),
+    existsSync: (...args: any[]) => fsExistsSyncMock(...args),
+    writeFileSync: (...args: any[]) => fsWriteFileSyncMock(...args),
+    mkdirSync: (...args: any[]) => fsMkdirSyncMock(...args),
+    statSync: (...args: any[]) => fsStatSyncMock(...args),
+    accessSync: (...args: any[]) => fsAccessSyncMock(...args),
+    readdirSync: (...args: any[]) => fsReaddirSyncMock(...args),
+    constants: { X_OK: 1 },
+  };
+  return { ...fsMock, default: fsMock };
+});
+
+vi.mock('electron', () => ({
+  app: {
+    getPath: () => '/tmp/emdash-test',
+  },
+}));
+
+vi.mock('../../main/services/AgentEventService', () => ({
+  agentEventService: {
+    getPort: () => agentEventGetPortMock(),
+    getToken: () => agentEventGetTokenMock(),
+  },
+}));
+
 describe('ptyManager provider command resolution', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -38,6 +74,10 @@ describe('ptyManager provider command resolution', () => {
       path: '/usr/local/bin/codex',
     });
     getProviderCustomConfigMock.mockReturnValue(undefined);
+    agentEventGetPortMock.mockReturnValue(0);
+    agentEventGetTokenMock.mockReturnValue('');
+    fsMkdirSyncMock.mockImplementation(() => undefined);
+    fsWriteFileSyncMock.mockImplementation(() => undefined);
   });
 
   it('resolves provider command config from custom settings', async () => {
@@ -83,6 +123,46 @@ describe('ptyManager provider command resolution', () => {
     ]);
   });
 
+  it('covers all configured provider auto-approve flags', async () => {
+    const { PROVIDERS } = await import('../../shared/providers/registry');
+    const { resolveProviderCommandConfig, buildProviderCliArgs, parseShellArgs } = await import(
+      '../../main/services/ptyManager'
+    );
+
+    const expectedAutoApproveFlags: Record<string, string> = {
+      amp: '--dangerously-allow-all',
+      autohand: '--unrestricted',
+      claude: '--dangerously-skip-permissions',
+      charm: '--yolo',
+      cline: '--yolo',
+      codex: '--full-auto',
+      copilot: '--allow-all-tools',
+      cursor: '-f',
+      gemini: '--yolo',
+      kimi: '--yolo',
+      kilocode: '--auto',
+      mistral: '--auto-approve',
+      qwen: '--yolo',
+      rovo: '--yolo',
+    };
+
+    const providerIdsWithAutoApprove = PROVIDERS.filter((provider) => provider.autoApproveFlag)
+      .map((provider) => provider.id)
+      .sort();
+    expect(providerIdsWithAutoApprove).toEqual(Object.keys(expectedAutoApproveFlags).sort());
+
+    for (const [providerId, expectedFlag] of Object.entries(expectedAutoApproveFlags)) {
+      const config = resolveProviderCommandConfig(providerId);
+      expect(config?.autoApproveFlag).toBe(expectedFlag);
+
+      const args = buildProviderCliArgs({
+        autoApprove: true,
+        autoApproveFlag: config?.autoApproveFlag,
+      });
+      expect(args).toEqual(parseShellArgs(expectedFlag));
+    }
+  });
+
   it('falls back when custom CLI needs shell parsing', async () => {
     getProviderCustomConfigMock.mockReturnValue({
       cli: 'codex --dangerously-bypass-approvals-and-sandbox',
@@ -119,5 +199,179 @@ describe('ptyManager provider command resolution', () => {
         Object.defineProperty(process, 'platform', originalPlatformDescriptor);
       }
     }
+  });
+
+  it('adds Codex notify runtime config when hooks are enabled', async () => {
+    agentEventGetPortMock.mockReturnValue(43123);
+
+    const { getProviderRuntimeCliArgs } = await import('../../main/services/ptyManager');
+    const args = getProviderRuntimeCliArgs({
+      providerId: 'codex',
+    });
+
+    expect(args).toContain('-c');
+    const notifyArg = args.find((arg) => arg.startsWith('notify='));
+    expect(notifyArg).toContain('X-Emdash-Event-Type: notification');
+    expect(notifyArg).toContain('$EMDASH_HOOK_PORT');
+  });
+
+  it('uses a PowerShell file for Codex notify runtime config on Windows', async () => {
+    agentEventGetPortMock.mockReturnValue(43123);
+
+    const { getProviderRuntimeCliArgs } = await import('../../main/services/ptyManager');
+    const args = getProviderRuntimeCliArgs({
+      providerId: 'codex',
+      platform: 'win32',
+    });
+
+    expect(args).toContain('-c');
+    const notifyArg = args.find((arg) => arg.startsWith('notify='));
+    expect(notifyArg).toContain('powershell.exe');
+    expect(notifyArg).toContain('"-File"');
+    expect(notifyArg).toContain('emdash-codex-notify.ps1');
+    expect(notifyArg).not.toContain('"sh"');
+    expect(fsWriteFileSyncMock).toHaveBeenCalledWith(
+      expect.stringContaining('emdash-codex-notify.ps1'),
+      expect.stringContaining('param([string]$payload)')
+    );
+    expect(fsMkdirSyncMock).toHaveBeenCalled();
+  });
+
+  it('uses an exact Codex thread target when one is stored', async () => {
+    fsReadFileSyncMock.mockReturnValue(
+      JSON.stringify({
+        'codex-main-task123': {
+          cwd: '/tmp/task',
+          providerId: 'codex',
+          resumeTarget: 'thread-123',
+          strategy: 'codex-thread-id',
+        },
+      })
+    );
+
+    const { getStoredExactResumeArgs, _resetSessionMapForTest } = await import(
+      '../../main/services/ptyManager'
+    );
+    _resetSessionMapForTest('/tmp/emdash-test/pty-session-map.json');
+
+    expect(getStoredExactResumeArgs('codex', 'codex-main-task123', '/tmp/task')).toEqual([
+      'resume',
+      'thread-123',
+    ]);
+  });
+
+  it('injects OPENCODE_CONFIG_DIR for local OpenCode PTYs', async () => {
+    const { applyProviderRuntimeEnv } = await import('../../main/services/ptyManager');
+
+    const env: Record<string, string> = {};
+    applyProviderRuntimeEnv(env, {
+      ptyId: 'opencode-main-task-123',
+      providerId: 'opencode',
+    });
+
+    expect(env.OPENCODE_CONFIG_DIR).toBe(
+      '/tmp/emdash-test/agent-hooks/opencode/opencode-main-task-123'
+    );
+    expect(fsMkdirSyncMock).toHaveBeenCalledWith(
+      '/tmp/emdash-test/agent-hooks/opencode/opencode-main-task-123/plugins',
+      { recursive: true }
+    );
+    expect(fsWriteFileSyncMock).toHaveBeenCalledWith(
+      '/tmp/emdash-test/agent-hooks/opencode/opencode-main-task-123/plugins/emdash-notify.js',
+      expect.stringContaining('session.idle')
+    );
+  });
+
+  it('does not inject OPENCODE_CONFIG_DIR for non-OpenCode PTYs', async () => {
+    const { applyProviderRuntimeEnv } = await import('../../main/services/ptyManager');
+
+    const env: Record<string, string> = {};
+    applyProviderRuntimeEnv(env, {
+      ptyId: 'codex-main-task-shell',
+      providerId: 'codex',
+    });
+
+    expect(env.OPENCODE_CONFIG_DIR).toBeUndefined();
+    expect(fsWriteFileSyncMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('stale Claude session detection', () => {
+  const SESSION_MAP_PATH = '/tmp/emdash-test/pty-session-map.json';
+  const TEST_CWD = '/tmp/test-worktree';
+  const TEST_UUID = 'test-uuid-00000000-0000-0000-0000';
+  const PTY_ID = 'claude-main-task123';
+
+  let applySessionIsolation: typeof import('../../main/services/ptyManager').applySessionIsolation;
+  let resetSessionMap: typeof import('../../main/services/ptyManager')._resetSessionMapForTest;
+  let claudeProvider: any;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsWriteFileSyncMock.mockImplementation(() => {});
+
+    // Load module once (avoid vi.resetModules — dynamic require('electron') isn't
+    // intercepted after module reset). Use _resetSessionMapForTest to clear
+    // the in-memory cache between tests instead.
+    const mod = await import('../../main/services/ptyManager');
+    applySessionIsolation = mod.applySessionIsolation;
+    resetSessionMap = mod._resetSessionMapForTest;
+    resetSessionMap(SESSION_MAP_PATH);
+
+    const { PROVIDERS } = await import('../../shared/providers/registry');
+    claudeProvider = PROVIDERS.find((p) => p.id === 'claude')!;
+  });
+
+  it('resumes when session file exists and cwd matches', () => {
+    const sessionMap = {
+      [PTY_ID]: { uuid: TEST_UUID, cwd: TEST_CWD },
+    };
+    fsReadFileSyncMock.mockReturnValue(JSON.stringify(sessionMap));
+    fsExistsSyncMock.mockImplementation((p: string) => {
+      if (p.endsWith(`${TEST_UUID}.jsonl`)) return true;
+      return false;
+    });
+
+    const cliArgs: string[] = [];
+    const result = applySessionIsolation(cliArgs, claudeProvider, PTY_ID, TEST_CWD, true);
+
+    expect(result).toBe(true);
+    expect(cliArgs).toContain('--resume');
+    expect(cliArgs).toContain(TEST_UUID);
+  });
+
+  it('does not resume when session file is missing', () => {
+    const sessionMap = {
+      [PTY_ID]: { uuid: TEST_UUID, cwd: TEST_CWD },
+    };
+    fsReadFileSyncMock.mockReturnValue(JSON.stringify(sessionMap));
+    fsExistsSyncMock.mockReturnValue(false);
+
+    const cliArgs: string[] = [];
+    const result = applySessionIsolation(cliArgs, claudeProvider, PTY_ID, TEST_CWD, true);
+
+    expect(result).toBe(false);
+    expect(cliArgs).not.toContain('--resume');
+    expect(cliArgs).not.toContain(TEST_UUID);
+    // Stale entry must be evicted from the persisted session map
+    expect(fsWriteFileSyncMock).toHaveBeenCalledWith(SESSION_MAP_PATH, JSON.stringify({}));
+  });
+
+  it('treats cwd mismatch as stale session', () => {
+    const sessionMap = {
+      [PTY_ID]: { uuid: TEST_UUID, cwd: '/tmp/old-worktree' },
+    };
+    fsReadFileSyncMock.mockReturnValue(JSON.stringify(sessionMap));
+    // File may exist, but cwd mismatch should still be treated as stale
+    fsExistsSyncMock.mockReturnValue(true);
+
+    const cliArgs: string[] = [];
+    const result = applySessionIsolation(cliArgs, claudeProvider, PTY_ID, TEST_CWD, true);
+
+    expect(result).toBe(false);
+    expect(cliArgs).not.toContain('--resume');
+    expect(cliArgs).not.toContain(TEST_UUID);
+    // Stale entry must be evicted from the persisted session map
+    expect(fsWriteFileSyncMock).toHaveBeenCalledWith(SESSION_MAP_PATH, JSON.stringify({}));
   });
 });
