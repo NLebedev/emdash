@@ -4,20 +4,29 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { ensureTerminalHost } from './terminalHost';
+import { TerminalInputBuffer } from './TerminalInputBuffer';
+import { classifyActivity } from '../lib/activityClassifier';
+import { agentStatusStore } from '../lib/agentStatusStore';
 import { TerminalMetrics } from './TerminalMetrics';
 import { log } from '../lib/logger';
 import { TERMINAL_SNAPSHOT_VERSION, type TerminalSnapshotPayload } from '#types/terminalSnapshot';
 import { pendingInjectionManager } from '../lib/PendingInjectionManager';
 import { getProvider, type ProviderId } from '@shared/providers/registry';
+import { consumeSubmittedInputChunk } from './submitCapture';
 import {
   CTRL_J_ASCII,
+  CTRL_U_ASCII,
   shouldCopySelectionFromTerminal,
+  shouldKillLineFromTerminal,
   shouldMapShiftEnterToCtrlJ,
+  shouldPasteToTerminal,
 } from './terminalKeybindings';
+import { rpc } from '@/lib/rpc';
 
 const SNAPSHOT_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const MAX_DATA_WINDOW_BYTES = 128 * 1024 * 1024; // 128 MB soft guardrail
 const FALLBACK_FONTS = 'Menlo, Monaco, Courier New, monospace';
+const DEFAULT_FONT_SIZE = 13;
 const MIN_RENDERABLE_TERMINAL_WIDTH_PX = 24;
 const MIN_RENDERABLE_TERMINAL_HEIGHT_PX = 24;
 const PTY_RESIZE_DEBOUNCE_MS = 60;
@@ -55,6 +64,7 @@ export interface TerminalSessionOptions {
   mapShiftEnterToCtrlJ?: boolean;
   disableSnapshots?: boolean;
   onLinkClick?: (url: string) => void;
+  onFirstMessage?: (message: string) => void;
 }
 
 type CleanupFn = () => void;
@@ -94,6 +104,13 @@ export class TerminalSessionManager {
   private pendingResize: { cols: number; rows: number } | null = null;
   private lastSentResize: { cols: number; rows: number } | null = null;
   private isPanelResizeDragging = false;
+  private hadFocusBeforeDetach = false;
+  private inputBuffer: TerminalInputBuffer | null = null;
+  private currentSubmittedInput = '';
+  private autoCopyOnSelection = false;
+  private selectionChangeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private terminalConfigFontSize: number | null = null;
+  private lastTheme: SessionTheme;
 
   // Timing for startup performance measurement
   private initStartTime: number = 0;
@@ -103,6 +120,7 @@ export class TerminalSessionManager {
   constructor(private readonly options: TerminalSessionOptions) {
     this.initStartTime = performance.now();
     this.id = options.taskId;
+    this.lastTheme = options.theme;
 
     this.container = document.createElement('div');
     this.container.className = 'terminal-session-root';
@@ -113,16 +131,29 @@ export class TerminalSessionManager {
     } as CSSStyleDeclaration);
     ensureTerminalHost().appendChild(this.container);
 
+    const openLink = (uri: string) => {
+      if (options.onLinkClick) {
+        options.onLinkClick(uri);
+      } else {
+        window.electronAPI.openExternal(uri).catch((error) => {
+          log.warn('Failed to open external link', { uri, error });
+        });
+      }
+    };
+
     this.terminal = new Terminal({
       cols: options.initialSize.cols,
       rows: options.initialSize.rows,
       scrollback: options.scrollbackLines,
       convertEol: true,
-      fontSize: 13,
+      fontSize: DEFAULT_FONT_SIZE,
       lineHeight: 1.2,
       letterSpacing: 0,
       allowProposedApi: true,
       scrollOnUserInput: false,
+      linkHandler: {
+        activate: (_event, text) => openLink(text),
+      },
     });
 
     const updateCustomFont = (customFont?: string) => {
@@ -130,8 +161,19 @@ export class TerminalSessionManager {
       this.applyEffectiveFont();
     };
 
-    window.electronAPI.getSettings().then((result) => {
-      updateCustomFont(result?.settings?.terminal?.fontFamily);
+    rpc.appSettings.get().then((settings) => {
+      updateCustomFont(settings?.terminal?.fontFamily);
+      this.autoCopyOnSelection = settings?.terminal?.autoCopyOnSelection ?? false;
+    });
+
+    window.electronAPI.terminalGetTheme().then((result) => {
+      if (this.disposed) return;
+      const size = result?.ok && result.config?.theme?.fontSize;
+      if (typeof size === 'number' && size > 0) {
+        this.terminalConfigFontSize = size;
+        this.applyTheme(this.lastTheme);
+        this.fitPreservingViewport();
+      }
     });
 
     const handleFontChange = (e: Event) => {
@@ -142,6 +184,15 @@ export class TerminalSessionManager {
     window.addEventListener('terminal-font-changed', handleFontChange);
     this.disposables.push(() =>
       window.removeEventListener('terminal-font-changed', handleFontChange)
+    );
+
+    const handleAutoCopyChange = (e: Event) => {
+      const detail = (e as CustomEvent<{ autoCopyOnSelection?: boolean }>).detail;
+      this.autoCopyOnSelection = detail?.autoCopyOnSelection ?? false;
+    };
+    window.addEventListener('terminal-auto-copy-changed', handleAutoCopyChange);
+    this.disposables.push(() =>
+      window.removeEventListener('terminal-auto-copy-changed', handleAutoCopyChange)
     );
 
     const handlePanelResizeDragging = (e: Event) => {
@@ -172,18 +223,8 @@ export class TerminalSessionManager {
 
     // Initialize WebLinks addon with custom handler
     this.webLinksAddon = new WebLinksAddon((event, uri) => {
-      // Prevent default behavior
       event.preventDefault();
-
-      // Call the custom link handler if provided, otherwise use default behavior
-      if (options.onLinkClick) {
-        options.onLinkClick(uri);
-      } else {
-        // Fallback to opening directly via electronAPI
-        window.electronAPI.openExternal(uri).catch((error) => {
-          log.warn('Failed to open external link', { uri, error });
-        });
-      }
+      openLink(uri);
     });
 
     this.terminal.loadAddon(this.fitAddon);
@@ -204,8 +245,8 @@ export class TerminalSessionManager {
         // ANSI mode request: CSI Ps $ p  →  respond CSI Ps ; 0 $ y
         const ansiDisp = parser.registerCsiHandler(
           { intermediates: '$', final: 'p' },
-          (params: { params: number[] }) => {
-            const mode = params.params[0] ?? 0;
+          (params: (number | number[])[]) => {
+            const mode = (params[0] as number) ?? 0;
             window.electronAPI.ptyInput({ id: ptyId, data: `\x1b[${mode};0$y` });
             return true;
           }
@@ -213,8 +254,8 @@ export class TerminalSessionManager {
         // DEC private mode request: CSI ? Ps $ p  →  respond CSI ? Ps ; 0 $ y
         const decDisp = parser.registerCsiHandler(
           { prefix: '?', intermediates: '$', final: 'p' },
-          (params: { params: number[] }) => {
-            const mode = params.params[0] ?? 0;
+          (params: (number | number[])[]) => {
+            const mode = (params[0] as number) ?? 0;
             window.electronAPI.ptyInput({ id: ptyId, data: `\x1b[?${mode};0$y` });
             return true;
           }
@@ -243,8 +284,6 @@ export class TerminalSessionManager {
 
     this.applyTheme(options.theme);
 
-    const isAgentSession = Boolean(options.providerId);
-
     // Custom key event handler: always attached so the dialog guard
     // runs for every terminal, plus optional copy/Shift+Enter handling.
     this.terminal.attachCustomKeyEventHandler((event: KeyboardEvent) => {
@@ -256,15 +295,21 @@ export class TerminalSessionManager {
         return false;
       }
 
-      if (
-        isAgentSession &&
-        shouldCopySelectionFromTerminal(event, IS_MAC_PLATFORM, this.terminal.hasSelection())
-      ) {
+      if (shouldCopySelectionFromTerminal(event, IS_MAC_PLATFORM, this.terminal.hasSelection())) {
         event.preventDefault();
         event.stopImmediatePropagation();
         event.stopPropagation();
         this.copySelectionToClipboard();
         return false; // Prevent xterm from processing the copy shortcut
+      }
+
+      // Handle Ctrl+Shift+V paste on Linux
+      if (shouldPasteToTerminal(event, IS_MAC_PLATFORM)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        event.stopPropagation();
+        this.pasteFromClipboard();
+        return false; // Prevent xterm from processing the paste shortcut
       }
 
       if (options.mapShiftEnterToCtrlJ && shouldMapShiftEnterToCtrlJ(event)) {
@@ -277,6 +322,33 @@ export class TerminalSessionManager {
         this.handleTerminalInput(CTRL_J_ASCII, true);
         return false; // Prevent xterm from processing the Shift+Enter
       }
+
+      if (shouldKillLineFromTerminal(event, IS_MAC_PLATFORM)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        event.stopPropagation();
+        this.handleTerminalInput(CTRL_U_ASCII, true);
+        return false;
+      }
+
+      // Map Cmd+Left/Right to Ctrl+A/E on macOS (line navigation)
+      if (IS_MAC_PLATFORM && event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+        if (event.key === 'ArrowLeft') {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          event.stopPropagation();
+          this.handleTerminalInput('\x01', true);
+          return false;
+        }
+        if (event.key === 'ArrowRight') {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          event.stopPropagation();
+          this.handleTerminalInput('\x05', true);
+          return false;
+        }
+      }
+
       return true; // Let xterm handle all other keys normally
     });
 
@@ -284,6 +356,14 @@ export class TerminalSessionManager {
       maxDataWindowBytes: MAX_DATA_WINDOW_BYTES,
       telemetry: options.telemetry ?? null,
     });
+
+    // Set up one-shot capture of the user's first terminal message
+    if (options.onFirstMessage) {
+      const callback = options.onFirstMessage;
+      this.inputBuffer = new TerminalInputBuffer((message) => {
+        callback(message);
+      });
+    }
 
     const inputDisposable = this.terminal.onData((data) => {
       this.handleTerminalInput(data);
@@ -318,6 +398,30 @@ export class TerminalSessionManager {
         element.style.width = '100%';
         element.style.height = '100%';
       }
+
+      const selectionDisposable = this.terminal.onSelectionChange(() => {
+        if (!this.autoCopyOnSelection || this.disposed) return;
+        if (!this.terminal.hasSelection()) return;
+        if (this.selectionChangeDebounceTimer) {
+          clearTimeout(this.selectionChangeDebounceTimer);
+        }
+        this.selectionChangeDebounceTimer = setTimeout(() => {
+          try {
+            if (!this.disposed && this.terminal.hasSelection()) {
+              this.copySelectionToClipboard();
+            }
+          } catch (error) {
+            log.warn('Auto-copy on selection failed', { id: this.id, error });
+          }
+        }, 150);
+      });
+      this.disposables.push(() => {
+        if (this.selectionChangeDebounceTimer) {
+          clearTimeout(this.selectionChangeDebounceTimer);
+          this.selectionChangeDebounceTimer = null;
+        }
+        selectionDisposable.dispose();
+      });
     }
 
     this.scheduleFit();
@@ -329,6 +433,9 @@ export class TerminalSessionManager {
     });
     this.resizeObserver.observe(container);
 
+    const shouldRestoreFocus = this.hadFocusBeforeDetach;
+    this.hadFocusBeforeDetach = false;
+
     requestAnimationFrame(() => {
       if (this.disposed) return;
       this.scheduleFit();
@@ -337,6 +444,9 @@ export class TerminalSessionManager {
       requestAnimationFrame(() => {
         if (!this.disposed) {
           this.restoreViewportPosition();
+          if (shouldRestoreFocus) {
+            this.terminal.focus();
+          }
         }
       });
     });
@@ -350,6 +460,9 @@ export class TerminalSessionManager {
   detach() {
     if (this.attachedContainer) {
       // Capture viewport position before detaching
+      const textarea = this.container.querySelector('.xterm-helper-textarea');
+      this.hadFocusBeforeDetach = textarea != null && textarea === document.activeElement;
+
       this.captureViewportPosition();
       this.cancelScheduledFit();
       this.cancelDeferredFits();
@@ -368,6 +481,7 @@ export class TerminalSessionManager {
   }
 
   setTheme(theme: SessionTheme) {
+    this.lastTheme = theme;
     this.applyTheme(theme);
   }
 
@@ -401,12 +515,18 @@ export class TerminalSessionManager {
         });
       }
     }
+    this.inputBuffer = null;
     this.metrics.dispose();
     this.activityListeners.clear();
     this.readyListeners.clear();
     this.errorListeners.clear();
     this.exitListeners.clear();
     this.terminal.dispose();
+    // Remove the container from the DOM to prevent orphaned nodes from accumulating
+    // in the terminal host, retaining xterm buffer memory across task switches.
+    try {
+      this.container.remove();
+    } catch {}
   }
 
   focus() {
@@ -505,6 +625,13 @@ export class TerminalSessionManager {
 
     if (!filtered) return;
 
+    const submittedText = this.consumeSubmittedInput(filtered, isNewlineInsert);
+
+    // Feed input to the buffer for first-message capture
+    if (this.inputBuffer && !this.inputBuffer.isComplete) {
+      this.inputBuffer.feed(filtered);
+    }
+
     // Track command execution when Enter is pressed (but not for newline inserts)
     const isEnterPress = filtered.includes('\r') || filtered.includes('\n');
     if (isEnterPress && !isNewlineInsert) {
@@ -521,18 +648,63 @@ export class TerminalSessionManager {
       const stripped = filtered.replace(/[\r\n]+$/g, '');
       const enterSequence = filtered.includes('\r') ? '\r' : '\n';
       const injectedData = stripped + pendingText + enterSequence + enterSequence;
+      if (submittedText || pendingText.trim()) {
+        agentStatusStore.markUserInputSubmitted({ ptyId: this.id });
+      }
       window.electronAPI.ptyInput({ id: this.id, data: injectedData });
       pendingInjectionManager.markUsed();
       return;
     }
 
+    if (isEnterPress && !isNewlineInsert && submittedText) {
+      agentStatusStore.markUserInputSubmitted({ ptyId: this.id });
+    }
     window.electronAPI.ptyInput({ id: this.id, data: filtered });
+  }
+
+  private consumeSubmittedInput(data: string, isNewlineInsert: boolean): string | null {
+    const result = consumeSubmittedInputChunk({
+      currentInput: this.currentSubmittedInput,
+      data,
+      isNewlineInsert,
+    });
+    this.currentSubmittedInput = result.currentInput;
+    return result.submittedText;
+  }
+
+  private cleanTerminalText(text: string): string {
+    if (!text) return text;
+
+    let cleaned = text;
+
+    cleaned = cleaned.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+    cleaned = cleaned.replace(/\x1b\][^\x07\x1b\\]*(\x07|\x1b\\)?/g, '');
+    cleaned = cleaned.replace(/\x1bP[^\x1b\\]*(\x1b\\)?/g, '');
+    cleaned = cleaned.replace(/\x1b[^\[P\]][\x20-\x7e]*/g, '');
+
+    cleaned = cleaned.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
+
+    cleaned = cleaned.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+    cleaned = cleaned
+      .split('\n')
+      .map((line) => line.replace(/[ \t]+$/, ''))
+      .join('\n');
+
+    cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+
+    cleaned = cleaned.trim();
+
+    return cleaned;
   }
 
   private copySelectionToClipboard() {
     try {
       const selected = this.terminal.getSelection();
       if (!selected) return;
+
+      const cleaned = this.cleanTerminalText(selected);
+
       const writeWithElectronFallback = () => {
         const fallbackWrite = (window as any)?.electronAPI?.clipboardWriteText;
         if (typeof fallbackWrite !== 'function') {
@@ -540,7 +712,7 @@ export class TerminalSessionManager {
           return;
         }
 
-        void fallbackWrite(selected).catch((error: unknown) => {
+        void fallbackWrite(cleaned).catch((error: unknown) => {
           log.warn('Failed to copy terminal selection via Electron fallback', {
             id: this.id,
             error,
@@ -553,7 +725,7 @@ export class TerminalSessionManager {
         navigator.clipboard &&
         typeof navigator.clipboard.writeText === 'function'
       ) {
-        void navigator.clipboard.writeText(selected).catch((error) => {
+        void navigator.clipboard.writeText(cleaned).catch((error) => {
           log.warn('Failed to copy terminal selection via navigator clipboard, falling back', {
             id: this.id,
             error,
@@ -567,6 +739,25 @@ export class TerminalSessionManager {
     } catch (error) {
       log.warn('Failed to copy terminal selection', { id: this.id, error });
     }
+  }
+
+  /**
+   * Paste text from clipboard into the terminal using Electron's native paste.
+   * Used for Ctrl+Shift+V on Linux.
+   */
+  private pasteFromClipboard() {
+    const paste = window.electronAPI?.paste;
+    if (typeof paste !== 'function') {
+      log.warn('Terminal paste API unavailable', { id: this.id });
+      return;
+    }
+
+    void paste().catch((error: unknown) => {
+      log.warn('Failed to paste to terminal', {
+        id: this.id,
+        error,
+      });
+    });
   }
 
   private applyTheme(theme: SessionTheme) {
@@ -595,22 +786,21 @@ export class TerminalSessionManager {
             ...selection,
           };
 
-    // Extract font settings before applying theme (they're not part of ITheme)
     const fontFamily = (theme.override as any)?.fontFamily;
-    const fontSize = (theme.override as any)?.fontSize;
+    const overrideFontSize = (theme.override as any)?.fontSize;
+    const effectiveFontSize =
+      typeof overrideFontSize === 'number' && overrideFontSize > 0
+        ? overrideFontSize
+        : (this.terminalConfigFontSize ?? DEFAULT_FONT_SIZE);
 
-    // Apply color theme (excluding font properties)
     const colorTheme = { ...theme.override };
     delete (colorTheme as any)?.fontFamily;
     delete (colorTheme as any)?.fontSize;
     this.terminal.options.theme = { ...base, ...colorTheme };
 
-    // Apply font settings separately
     this.themeFontFamily = typeof fontFamily === 'string' ? fontFamily.trim() : '';
     this.applyEffectiveFont();
-    if (fontSize) {
-      this.terminal.options.fontSize = fontSize;
-    }
+    this.terminal.options.fontSize = effectiveFontSize;
   }
 
   private applyEffectiveFont() {
@@ -839,9 +1029,17 @@ export class TerminalSessionManager {
     // Connect to PTY - pass resume flag if we have a previous session
     const result = await this.connectPty(hasSnapshot);
 
+    // When tmux is active, disable snapshots — tmux preserves terminal state natively.
+    if (result?.tmux) {
+      this.options.disableSnapshots = true;
+      this.stopSnapshotTimer();
+    }
+
     // Decide whether to restore snapshot based on PTY result
     try {
-      if (result?.reused) {
+      if (result?.tmux) {
+        // Tmux session: skip snapshot — tmux restores its own scrollback on reattach
+      } else if (result?.reused) {
         // Hot reload - PTY still running, restore snapshot for visual continuity
         if (snapshot) {
           this.applySnapshot(snapshot);
@@ -893,7 +1091,7 @@ export class TerminalSessionManager {
 
   private async connectPty(
     hasExistingSession: boolean = false
-  ): Promise<{ ok: boolean; reused?: boolean; error?: string }> {
+  ): Promise<{ ok: boolean; reused?: boolean; tmux?: boolean; error?: string }> {
     this.ptyConnectStartTime = performance.now();
     const { taskId, cwd, providerId, shell, env, initialSize, autoApprove, initialPrompt } =
       this.options;
@@ -940,11 +1138,22 @@ export class TerminalSessionManager {
       this.sendSizeIfStarted();
       this.emitReady();
       try {
-        const offStarted = window.electronAPI.onPtyStarted?.((payload: { id: string }) => {
+        let offStarted: (() => void) | undefined;
+        const removeOffStartedFromDisposables = () => {
+          if (!offStarted) return;
+          const idx = this.disposables.indexOf(offStarted);
+          if (idx >= 0) this.disposables.splice(idx, 1);
+        };
+        offStarted = window.electronAPI.onPtyStarted?.((payload: { id: string }) => {
           if (payload?.id === id) {
             this.ptyStarted = true;
             this.lastSentResize = null;
             this.sendSizeIfStarted();
+            try {
+              offStarted?.();
+            } catch {}
+            removeOffStartedFromDisposables();
+            offStarted = undefined;
           }
         });
         if (offStarted) this.disposables.push(offStarted);
@@ -970,6 +1179,14 @@ export class TerminalSessionManager {
       }
       const buffer = this.terminal.buffer?.active;
       const isAtBottom = buffer ? buffer.baseY - buffer.viewportY <= 2 : true;
+
+      // Check if agent started processing — confirms the user's input was accepted
+      if (this.inputBuffer && !this.inputBuffer.isComplete) {
+        const signal = classifyActivity(this.options.providerId ?? null, chunk);
+        if (signal === 'busy') {
+          this.inputBuffer.confirmSubmit();
+        }
+      }
 
       try {
         this.terminal.write(chunk);

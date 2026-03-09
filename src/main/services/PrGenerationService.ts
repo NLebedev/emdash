@@ -1,10 +1,10 @@
-import { exec, execFile, spawn } from 'child_process';
+import { spawn, exec } from 'child_process';
 import { promisify } from 'util';
 import { log } from '../lib/logger';
-import { getProvider, PROVIDER_IDS, type ProviderId } from '../../shared/providers/registry';
+import { getProvider, type ProviderId } from '@shared/providers/registry';
 
 const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
+const execFileAsync = promisify(require('child_process').execFile);
 
 export interface GeneratedPrContent {
   title: string;
@@ -18,355 +18,229 @@ export interface GeneratedCommitMessage {
 }
 
 /**
- * Generates PR title and description using available CLI agents or fallback heuristics
+ * PrGenerationService uses CLI providers (like Claude Code) to generate
+ * PR titles and descriptions based on git diffs.
  */
 export class PrGenerationService {
   /**
-   * Generate PR title and description based on git changes
-   * @param taskPath - Path to the task
-   * @param baseBranch - Base branch to compare against (default: 'main')
-   * @param preferredProviderId - Optional provider ID to use first (e.g., from task.agentId)
+   * Main entry point: Generate PR content for a worktree.
+   * Fetches the diff against base and invokes the provider.
    */
   async generatePrContent(
     taskPath: string,
-    baseBranch: string = 'main',
-    preferredProviderId?: string | null
-  ): Promise<GeneratedPrContent> {
+    base: string = 'main',
+    providerId: string | null = null
+  ): Promise<GeneratedPrContent | null> {
+    const activeProviderId = (providerId || 'claude') as ProviderId;
+
+    if (!this.canUseForPrGeneration(activeProviderId)) {
+      log.debug(`Provider ${activeProviderId} does not support PR generation`);
+      return null;
+    }
+
     try {
-      // Get git diff and commit messages
-      const { diff, commits, changedFiles } = await this.getGitContext(taskPath, baseBranch);
+      // 1. Get diff and commit subjects
+      const [diffResult, logResult] = await Promise.all([
+        execAsync(`git diff origin/${base}...HEAD`, {
+          cwd: taskPath,
+          maxBuffer: 10 * 1024 * 1024,
+        }),
+        execAsync(`git log --oneline origin/${base}..HEAD`, { cwd: taskPath }),
+      ]);
 
-      if (!diff && commits.length === 0) {
-        return this.generateFallbackContent(changedFiles);
+      const diff = (diffResult.stdout || '').trim();
+      const commits = (logResult.stdout || '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      if (!diff) {
+        log.debug('No diff found for PR generation');
+        return null;
       }
 
-      // Try the task's provider first if specified
-      if (preferredProviderId && this.isValidProviderId(preferredProviderId)) {
-        try {
-          const preferredResult = await this.generateWithProvider(
-            preferredProviderId as ProviderId,
-            taskPath,
-            diff,
-            commits
-          );
-          if (preferredResult) {
-            log.info(`Generated PR content with task provider: ${preferredProviderId}`);
-            return {
-              title: preferredResult.title,
-              description: this.normalizeMarkdown(preferredResult.description),
-            };
-          }
-        } catch (error) {
-          log.debug(`Task provider ${preferredProviderId} generation failed, trying fallbacks`, {
-            error,
-          });
-        }
-      }
-
-      // Try Claude Code as fallback (preferred default)
-      try {
-        const claudeResult = await this.generateWithProvider('claude', taskPath, diff, commits);
-        if (claudeResult) {
-          log.info('Generated PR content with Claude Code');
-          return {
-            title: claudeResult.title,
-            description: this.normalizeMarkdown(claudeResult.description),
-          };
-        }
-      } catch (error) {
-        log.debug('Claude Code generation failed, trying fallback', { error });
-      }
-
-      // Try Codex as fallback
-      try {
-        const codexResult = await this.generateWithProvider('codex', taskPath, diff, commits);
-        if (codexResult) {
-          log.info('Generated PR content with Codex');
-          return {
-            title: codexResult.title,
-            description: this.normalizeMarkdown(codexResult.description),
-          };
-        }
-      } catch (error) {
-        log.debug('Codex generation failed, using heuristic fallback', { error });
-      }
-
-      // Fallback to heuristic-based generation
-      return this.generateHeuristicContent(diff, commits, changedFiles);
+      // 2. Invoke provider
+      return await this.generateWithProvider(activeProviderId, taskPath, diff, commits);
     } catch (error) {
-      log.error('Failed to generate PR content', { error });
-      return this.generateFallbackContent([]);
+      log.error('Failed to fetch git context for PR generation', error);
+      return null;
     }
   }
 
   /**
-   * Generate a single commit message based only on staged changes.
+   * Generate a commit message from staged changes.
    */
   async generateCommitMessage(
     taskPath: string,
-    preferredProviderId?: string | null
-  ): Promise<GeneratedCommitMessage> {
-    const { stagedDiffStat, stagedDiffPatch, stagedFiles } = await this.getStagedGitContext(taskPath);
+    providerId: string | null = null
+  ): Promise<GeneratedCommitMessage | null> {
+    const activeProviderId = (providerId || 'claude') as ProviderId;
 
-    if (!stagedDiffStat && !stagedDiffPatch && stagedFiles.length === 0) {
-      return {
-        message: 'chore: apply staged changes',
-        source: 'heuristic',
-      };
+    if (!this.canUseForPrGeneration(activeProviderId)) {
+      return this.generateHeuristicCommitMessage(taskPath);
     }
-
-    const prompt = this.buildCommitMessagePrompt(stagedDiffStat, stagedDiffPatch, stagedFiles);
-    const triedProviders = new Set<ProviderId>();
-
-    const tryProvider = async (providerId: ProviderId): Promise<GeneratedCommitMessage | null> => {
-      if (triedProviders.has(providerId)) {
-        return null;
-      }
-      triedProviders.add(providerId);
-
-      try {
-        const response = await this.invokeProviderForPrompt(providerId, taskPath, prompt);
-        if (!response) return null;
-        const parsed = this.parseCommitMessageResponse(response);
-        if (!parsed) return null;
-
-        return {
-          message: parsed,
-          providerId,
-          source: 'provider',
-        };
-      } catch (error) {
-        log.debug(`Commit message generation failed for provider ${providerId}`, { error });
-        return null;
-      }
-    };
-
-    if (preferredProviderId && this.isValidProviderId(preferredProviderId)) {
-      const preferred = await tryProvider(preferredProviderId as ProviderId);
-      if (preferred) return preferred;
-    }
-
-    const claudeResult = await tryProvider('claude');
-    if (claudeResult) return claudeResult;
-
-    const codexResult = await tryProvider('codex');
-    if (codexResult) return codexResult;
-
-    return {
-      message: this.generateHeuristicCommitMessage(stagedFiles, stagedDiffStat),
-      source: 'heuristic',
-    };
-  }
-
-  /**
-   * Get git context (diff, commits, changed files) for PR generation
-   */
-  private async getGitContext(
-    taskPath: string,
-    baseBranch: string
-  ): Promise<{ diff: string; commits: string[]; changedFiles: string[] }> {
-    let diff = '';
-    let commits: string[] = [];
-    let changedFiles: string[] = [];
 
     try {
-      // Fetch remote to ensure we have latest state (prevents comparing against stale local branches)
-      // This is critical: if local main is behind remote, we'd incorrectly include others' commits
-      // Only fetch if remote exists
-      try {
-        await execAsync('git remote get-url origin', { cwd: taskPath });
-        // Remote exists, try to fetch
-        try {
-          await execAsync('git fetch origin --quiet', { cwd: taskPath });
-        } catch (fetchError) {
-          log.debug('Failed to fetch remote, continuing with existing refs', { fetchError });
-        }
-      } catch {
-        // Remote doesn't exist, skip fetch
-        log.debug('Remote origin not found, skipping fetch');
+      const context = await this.getStagedGitContext(taskPath);
+      if (!context.stagedDiffPatch && context.stagedFiles.length === 0) {
+        return null;
       }
 
-      // Always prefer remote branch to avoid stale local branch issues
-      let baseBranchRef = baseBranch;
-      let baseBranchExists = false;
+      const prompt = this.buildCommitMessagePrompt(
+        context.stagedDiffStat,
+        context.stagedDiffPatch,
+        context.stagedFiles
+      );
 
-      // First try remote branch (most reliable - always up to date)
-      try {
-        await execAsync(`git rev-parse --verify origin/${baseBranch}`, { cwd: taskPath });
-        baseBranchExists = true;
-        baseBranchRef = `origin/${baseBranch}`;
-      } catch {
-        // Fall back to local branch only if remote doesn't exist
-        try {
-          await execAsync(`git rev-parse --verify ${baseBranch}`, { cwd: taskPath });
-          baseBranchExists = true;
-          baseBranchRef = baseBranch;
-        } catch {
-          // Base branch doesn't exist, will use working directory diff
-        }
-      }
+      const provider = getProvider(activeProviderId);
+      const cliCommand = provider!.cli!;
 
-      if (baseBranchExists) {
-        // Get diff between base branch and current HEAD (committed changes)
-        try {
-          const { stdout: diffOut } = await execAsync(`git diff ${baseBranchRef}...HEAD --stat`, {
-            cwd: taskPath,
-            maxBuffer: 10 * 1024 * 1024,
-          });
-          diff = diffOut || '';
+      // Try up to 2 times
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const { result, shouldRetry } = await this.spawnProvider(
+          activeProviderId,
+          cliCommand,
+          provider,
+          taskPath,
+          prompt
+        );
 
-          // Get list of changed files from commits
-          const { stdout: filesOut } = await execAsync(
-            `git diff --name-only ${baseBranchRef}...HEAD`,
-            { cwd: taskPath }
-          );
-          const committedFiles = (filesOut || '')
-            .split('\n')
-            .map((f) => f.trim())
-            .filter(Boolean);
-          changedFiles.push(...committedFiles);
-
-          // Get commit messages
-          const { stdout: commitsOut } = await execAsync(
-            `git log ${baseBranchRef}..HEAD --pretty=format:"%s"`,
-            { cwd: taskPath }
-          );
-          commits = (commitsOut || '')
-            .split('\n')
-            .map((c) => c.trim())
-            .filter(Boolean);
-        } catch (error) {
-          log.debug('Failed to get diff/commits from base branch', { error });
-        }
-      }
-
-      // Also include uncommitted changes (working directory) to capture all changes
-      // This ensures PR description includes changes that will be committed
-      try {
-        const { stdout: workingDiff } = await execAsync('git diff --stat', {
-          cwd: taskPath,
-          maxBuffer: 10 * 1024 * 1024,
-        });
-        const workingDiffText = workingDiff || '';
-
-        // If we have both committed and uncommitted changes, combine them
-        if (workingDiffText && diff) {
-          // Combine diff stats (working directory changes will be added)
-          diff = `${diff}\n${workingDiffText}`;
-        } else if (workingDiffText && !diff) {
-          // Only uncommitted changes
-          diff = workingDiffText;
+        if (result && (result as any).message) {
+          return {
+            message: (result as any).message,
+            providerId: activeProviderId,
+            source: 'provider',
+          };
         }
 
-        // Get uncommitted changed files and merge with committed files
-        const { stdout: filesOut } = await execAsync('git diff --name-only', {
-          cwd: taskPath,
-        });
-        const uncommittedFiles = (filesOut || '')
-          .split('\n')
-          .map((f) => f.trim())
-          .filter(Boolean);
+        // Handle if parseProviderResponse returned GeneratedPrContent instead of commit message
+        if (result && (result as any).title) {
+          return {
+            message: (result as any).title,
+            providerId: activeProviderId,
+            source: 'provider',
+          };
+        }
 
-        // Merge file lists, avoiding duplicates
-        const allFiles = new Set([...changedFiles, ...uncommittedFiles]);
-        changedFiles = Array.from(allFiles);
-      } catch (error) {
-        log.debug('Failed to get working directory diff', { error });
+        if (!shouldRetry) break;
       }
 
-      // Fallback: if we still have no diff or commits, try staged changes
-      if (commits.length === 0 && diff.length === 0) {
-        try {
-          const { stdout: stagedDiff } = await execAsync('git diff --cached --stat', {
-            cwd: taskPath,
-            maxBuffer: 10 * 1024 * 1024,
-          });
-          if (stagedDiff) {
-            diff = stagedDiff;
-            const { stdout: filesOut } = await execAsync('git diff --cached --name-only', {
-              cwd: taskPath,
-            });
-            changedFiles = (filesOut || '')
-              .split('\n')
-              .map((f) => f.trim())
-              .filter(Boolean);
-          }
-        } catch {}
-      }
+      return this.generateHeuristicCommitMessage(taskPath);
     } catch (error) {
-      log.warn('Failed to get git context', { error });
+      log.error('Failed to generate commit message', error);
+      return this.generateHeuristicCommitMessage(taskPath);
     }
+  }
 
-    return { diff, commits, changedFiles };
+  private async generateHeuristicCommitMessage(taskPath: string): Promise<GeneratedCommitMessage> {
+    try {
+      const { stdout } = await execAsync('git diff --cached --name-only', { cwd: taskPath });
+      const files = stdout
+        .split('\n')
+        .map((f) => f.trim())
+        .filter(Boolean);
+      if (files.length === 0) return { message: 'Update files', source: 'heuristic' };
+      if (files.length === 1) return { message: `Update ${files[0]}`, source: 'heuristic' };
+      return { message: `Update ${files.length} files`, source: 'heuristic' };
+    } catch {
+      return { message: 'Update files', source: 'heuristic' };
+    }
   }
 
   /**
-   * Generate PR content using a CLI provider (Claude Code or Codex)
+   * Check if a provider can be used for automated PR generation.
+   * Requires a CLI and support for initial prompts.
    */
+  private canUseForPrGeneration(providerId: ProviderId): boolean {
+    const provider = getProvider(providerId);
+    if (!provider || !provider.cli) return false;
+
+    // Currently only allow providers that support passing a prompt via CLI arg.
+    // (initialPromptFlag: '' means positional arg, '-i' means flag)
+    return provider.initialPromptFlag !== undefined;
+  }
+
   private async generateWithProvider(
     providerId: ProviderId,
     taskPath: string,
     diff: string,
     commits: string[]
   ): Promise<GeneratedPrContent | null> {
-    const prompt = this.buildPrGenerationPrompt(diff, commits);
-    const response = await this.invokeProviderForPrompt(providerId, taskPath, prompt);
-    if (!response) {
+    if (!this.canUseForPrGeneration(providerId)) {
       return null;
     }
 
-    const result = this.parseProviderResponse(response);
-    if (result) {
-      log.info(`Successfully generated PR content with ${providerId}`);
-      return result;
+    const provider = getProvider(providerId);
+    const cliCommand = provider!.cli!;
+
+    // Build prompt for PR generation
+    const prompt = this.buildPrGenerationPrompt(diff, commits);
+
+    // Try up to 2 times: retry once if the process succeeded but JSON parsing failed
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { result, shouldRetry } = await this.spawnProvider(
+        providerId,
+        cliCommand,
+        provider,
+        taskPath,
+        prompt
+      );
+      if (result) return result as GeneratedPrContent;
+      if (!shouldRetry) break;
+      log.debug(`Retrying provider ${providerId} (attempt ${attempt + 2}/2) after parse failure`);
     }
 
-    log.debug(`Failed to parse response from ${providerId}`, { response });
     return null;
   }
 
-  private async invokeProviderForPrompt(
+  /**
+   * Spawn a provider CLI process and collect its output.
+   * Returns the parsed result (if any) and whether a retry is worthwhile.
+   */
+  private spawnProvider(
     providerId: ProviderId,
+    cliCommand: string,
+    provider: ReturnType<typeof getProvider>,
     taskPath: string,
     prompt: string
-  ): Promise<string | null> {
-    const provider = getProvider(providerId);
-    if (!provider || !provider.cli) {
-      return null;
-    }
-
-    const cliCommand = provider.cli;
-    if (!cliCommand) {
-      return null;
-    }
-
-    try {
-      await execFileAsync(cliCommand, provider.versionArgs || ['--version'], {
-        cwd: taskPath,
-      });
-    } catch {
-      log.debug(`Provider ${providerId} CLI not available`);
-      return null;
-    }
-
-    return new Promise<string | null>((resolve) => {
-      const timeout = 30000;
+  ): Promise<{ result: GeneratedPrContent | { message: string } | null; shouldRetry: boolean }> {
+    return new Promise((resolve) => {
+      const timeout = 60000;
       let stdout = '';
       let stderr = '';
+      let resolved = false;
+
+      const done = (
+        result: GeneratedPrContent | { message: string } | null,
+        shouldRetry: boolean
+      ) => {
+        if (resolved) return;
+        resolved = true;
+        resolve({ result, shouldRetry });
+      };
 
       const args: string[] = [];
-      if (provider.defaultArgs?.length) {
-        args.push(...provider.defaultArgs);
-      }
-      if (provider.autoApproveFlag) {
-        args.push(provider.autoApproveFlag);
+      const isClaudeProvider = providerId === 'claude';
+
+      if (isClaudeProvider) {
+        args.push('-p', prompt, '--output-format', 'json');
+        if (provider!.autoApproveFlag) {
+          args.push(provider!.autoApproveFlag);
+        }
+      } else {
+        if (provider!.defaultArgs?.length) {
+          args.push(...provider!.defaultArgs);
+        }
+        if (provider!.autoApproveFlag) {
+          args.push(provider!.autoApproveFlag);
+        }
       }
 
-      let promptViaStdin = true;
-      if (provider.initialPromptFlag !== undefined && provider.initialPromptFlag !== '') {
-        args.push(provider.initialPromptFlag);
+      if (!isClaudeProvider && provider!.initialPromptFlag !== undefined) {
+        if (provider!.initialPromptFlag) {
+          args.push(provider!.initialPromptFlag);
+        }
         args.push(prompt);
-        promptViaStdin = false;
       }
 
       const child = spawn(cliCommand, args, {
@@ -374,8 +248,9 @@ export class PrGenerationService {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: {
           ...process.env,
-          TERM: 'xterm-256color',
-          COLORTERM: 'truecolor',
+          // Force non-interactive modes for some CLIs if possible
+          PAGER: 'cat',
+          TERM: 'dumb',
         },
       });
 
@@ -384,7 +259,7 @@ export class PrGenerationService {
           child.kill('SIGTERM');
         } catch {}
         log.debug(`Provider ${providerId} invocation timed out`);
-        resolve(null);
+        done(null, false);
       }, timeout);
 
       if (child.stdout) {
@@ -392,79 +267,63 @@ export class PrGenerationService {
           stdout += data.toString('utf8');
         });
       }
-
       if (child.stderr) {
         child.stderr.on('data', (data: Buffer) => {
           stderr += data.toString('utf8');
         });
       }
 
-      child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+      child.on('close', (code: number) => {
         clearTimeout(timeoutId);
-
-        if (code !== 0 && code !== null) {
+        if (code !== 0 && !stdout.trim()) {
           log.debug(`Provider ${providerId} exited with code ${code}`, { stderr });
-          resolve(null);
+          done(null, false);
           return;
         }
 
-        if (signal) {
-          log.debug(`Provider ${providerId} killed by signal ${signal}`);
-          resolve(null);
-          return;
+        const result = this.parseProviderResponse(stdout);
+        if (result) {
+          log.info(`Successfully generated content with ${providerId}`);
+          done(result, false);
+        } else {
+          log.debug(`Failed to parse response from ${providerId}`, { stdout, stderr });
+          done(null, true);
         }
-
-        resolve(stdout);
       });
 
       child.on('error', (error: Error) => {
         clearTimeout(timeoutId);
         log.debug(`Failed to spawn ${providerId}`, { error });
-        resolve(null);
+        done(null, false);
       });
 
-      if (promptViaStdin) {
-        try {
-          if (child.stdin) {
-            child.stdin.write(prompt);
-            child.stdin.write('\n');
-            child.stdin.end();
-          }
-        } catch (error) {
-          clearTimeout(timeoutId);
-          try {
-            child.kill();
-          } catch {}
-          log.debug(`Failed to write prompt to ${providerId}`, { error });
-          resolve(null);
-        }
-      } else if (child.stdin) {
+      if (child.stdin) {
         child.stdin.end();
       }
     });
   }
 
-  /**
-   * Build prompt for PR generation
-   */
   private buildPrGenerationPrompt(diff: string, commits: string[]): string {
-    const commitContext =
-      commits.length > 0 ? `\n\nCommits:\n${commits.map((c) => `- ${c}`).join('\n')}` : '';
-    const diffContext = diff
-      ? `\n\nDiff summary:\n${diff.substring(0, 2000)}${diff.length > 2000 ? '...' : ''}`
-      : '';
+    const diffLimit = 15000;
+    const truncatedDiff =
+      diff.length > diffLimit ? diff.slice(0, diffLimit) + '\n\n[Diff truncated...]' : diff;
 
-    return `Generate a concise PR title and description based on these changes:
+    return `You are helping a developer generate a Pull Request title and description based on their git changes.
 
-${commitContext}${diffContext}
+Commits in this PR:
+${commits.map((c) => `- ${c}`).join('\n')}
 
-Please respond in the following JSON format:
+Git Diff:
+\`\`\`diff
+${truncatedDiff}
+\`\`\`
+
+Respond with ONLY valid JSON — no markdown fences, no conversational filler.
+Format:
 {
   "title": "A concise PR title (max 72 chars, use conventional commit format if applicable)",
   "description": "A well-structured markdown description using proper markdown formatting. Use ## for section headers, - or * for lists, \`code\` for inline code, and proper line breaks.\n\nUse actual newlines (\\n in JSON) for line breaks, not literal \\n text. Keep it straightforward and to the point."
-}
-
-Only respond with valid JSON, no other text.`;
+}`;
   }
 
   private async getStagedGitContext(taskPath: string): Promise<{
@@ -517,7 +376,10 @@ Only respond with valid JSON, no other text.`;
   ): string {
     const filesContext =
       stagedFiles.length > 0
-        ? `\n\nStaged files:\n${stagedFiles.slice(0, 80).map((file) => `- ${file}`).join('\n')}`
+        ? `\n\nStaged files:\n${stagedFiles
+            .slice(0, 80)
+            .map((file) => `- ${file}`)
+            .join('\n')}`
         : '';
     const statsContext = stagedDiffStat ? `\n\nStaged diff stats:\n${stagedDiffStat}` : '';
     const patchLimit = 5000;
@@ -542,332 +404,48 @@ Respond in JSON only:
 }`;
   }
 
-  /**
-   * Parse provider response into PR content
-   */
-  private parseProviderResponse(response: string): GeneratedPrContent | null {
+  private stripAnsi(text: string): string {
+    // Covers CSI sequences, OSC sequences, and other common escape codes
+    // eslint-disable-next-line no-control-regex
+    return text.replace(
+      /\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[^[(\x1b]*?[a-zA-Z]/g,
+      ''
+    );
+  }
+
+  private parseProviderResponse(response: string): GeneratedPrContent | { message: string } | null {
     try {
-      // Try to extract JSON from response
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
+      const clean = this.stripAnsi(response).trim();
+      if (!clean) return null;
+
+      // 1. Try direct JSON parse
+      try {
+        const parsed = JSON.parse(clean);
+        if (this.isValidResponse(parsed)) return parsed;
+      } catch {}
+
+      // 2. Try to find JSON block in the output
+      const jsonMatch = clean.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        if (parsed.title && parsed.description) {
-          let description = String(parsed.description);
-
-          // Handle multiple newline escape scenarios:
-          // 1. Literal backslash-n sequences (from double-escaped JSON like "\\n")
-          // 2. String representations of newlines
-          // Do this before trimming to preserve intentional whitespace
-
-          // First, check if we have literal \n characters (backslash followed by n)
-          // This happens when JSON contains "\\n" which becomes "\n" after parsing
-          if (description.includes('\\n')) {
-            // Replace literal backslash-n with actual newlines
-            description = description.replace(/\\n/g, '\n');
-          }
-
-          // Also handle case where newlines might be represented as literal text "\\n" (double backslash)
-          // This is less common but could happen if the LLM outputs raw text
-          description = description.replace(/\\\\n/g, '\n');
-
-          // Trim after processing newlines
-          description = description.trim();
-
-          return {
-            title: parsed.title.trim(),
-            description,
-          };
-        }
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (this.isValidResponse(parsed)) return parsed;
+        } catch {}
       }
+
+      return null;
     } catch (error) {
       log.debug('Failed to parse provider response', { error, response });
-    }
-    return null;
-  }
-
-  private parseCommitMessageResponse(response: string): string | null {
-    try {
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        if (typeof parsed?.message === 'string') {
-          return this.normalizeCommitMessage(parsed.message);
-        }
-      }
-    } catch (error) {
-      log.debug('Failed to parse commit message JSON response', { error, response });
-    }
-
-    const candidate = response
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .find((line) => !line.startsWith('```') && !line.startsWith('{') && !line.startsWith('}'));
-
-    if (!candidate) {
       return null;
     }
-
-    return this.normalizeCommitMessage(candidate);
   }
 
-  private normalizeCommitMessage(message: string): string | null {
-    let normalized = message.trim();
-    normalized = normalized.replace(/^["'`]+|["'`]+$/g, '');
-    normalized = normalized.replace(/^commit message:\s*/i, '');
-    normalized = normalized.replace(/\s+/g, ' ').trim();
-
-    if (!normalized) {
-      return null;
-    }
-
-    if (normalized.length > 72) {
-      normalized = `${normalized.slice(0, 69).trimEnd()}...`;
-    }
-
-    return normalized || null;
-  }
-
-  private generateHeuristicCommitMessage(stagedFiles: string[], stagedDiffStat: string): string {
-    if (stagedFiles.length === 0) {
-      return 'chore: apply staged changes';
-    }
-
-    const lowerFiles = stagedFiles.map((file) => file.toLowerCase());
-    const onlyDocs = lowerFiles.every(
-      (file) =>
-        file.includes('/docs/') ||
-        file.endsWith('.md') ||
-        file.endsWith('.mdx') ||
-        file.endsWith('.txt') ||
-        file.endsWith('.rst')
+  private isValidResponse(parsed: any): parsed is GeneratedPrContent | { message: string } {
+    if (!parsed || typeof parsed !== 'object') return false;
+    return (
+      (typeof parsed.title === 'string' && typeof parsed.description === 'string') ||
+      typeof parsed.message === 'string'
     );
-    if (onlyDocs) {
-      return stagedFiles.length === 1
-        ? `docs: update ${stagedFiles[0].split('/').pop() || 'docs'}`
-        : 'docs: update documentation';
-    }
-
-    const hasTests = lowerFiles.some(
-      (file) =>
-        file.includes('/test/') ||
-        file.includes('/tests/') ||
-        file.includes('.test.') ||
-        file.includes('.spec.')
-    );
-    if (hasTests) {
-      return 'test: update coverage for staged changes';
-    }
-
-    const hasFixHint = lowerFiles.some(
-      (file) =>
-        file.includes('fix') ||
-        file.includes('bug') ||
-        file.includes('issue') ||
-        file.includes('error')
-    );
-    if (hasFixHint) {
-      return 'fix: address staged changes';
-    }
-
-    const statsMatch = stagedDiffStat.match(
-      /(\d+)\s+files? changed(?:,\s+(\d+)\s+insertions?\(\+\))?(?:,\s+(\d+)\s+deletions?\(-\))?/i
-    );
-    const fileCount = statsMatch ? parseInt(statsMatch[1] || '0', 10) || stagedFiles.length : stagedFiles.length;
-
-    if (fileCount === 1) {
-      const single = stagedFiles[0].split('/').pop() || stagedFiles[0];
-      return `chore: update ${single.replace(/\.[^.]+$/, '')}`;
-    }
-
-    return `chore: update ${fileCount} files`;
-  }
-
-  /**
-   * Generate PR content using heuristics based on commits and files
-   */
-  private generateHeuristicContent(
-    diff: string,
-    commits: string[],
-    changedFiles: string[]
-  ): GeneratedPrContent {
-    // Use first commit message as title if available (best case)
-    let title = 'chore: update code';
-    if (commits.length > 0) {
-      // Use the most recent commit message as title
-      title = commits[0];
-
-      // Clean up common prefixes that might not be needed in PR title
-      title = title.replace(
-        /^(feat|fix|chore|docs|style|refactor|test|perf|ci|build|revert):\s*/i,
-        ''
-      );
-
-      // Ensure title is not too long (GitHub PR title limit is ~72 chars)
-      if (title.length > 72) {
-        title = title.substring(0, 69) + '...';
-      }
-
-      // Re-add conventional commit prefix if it was there
-      const firstCommit = commits[0];
-      const prefixMatch = firstCommit.match(
-        /^(feat|fix|chore|docs|style|refactor|test|perf|ci|build|revert):/i
-      );
-      if (prefixMatch && !title.startsWith(prefixMatch[1])) {
-        title = `${prefixMatch[1]}: ${title}`;
-      }
-    } else if (changedFiles.length > 0) {
-      // Generate title from file changes when no commits available
-      const mainFile = changedFiles[0];
-      const fileParts = mainFile.split('/');
-      const fileName = fileParts[fileParts.length - 1];
-      const baseName = fileName.replace(/\.[^.]*$/, ''); // Remove extension
-
-      // Analyze file patterns to infer intent
-      if (fileName.match(/test|spec/i)) {
-        title = 'test: add tests';
-      } else if (fileName.match(/fix|bug|error/i)) {
-        title = 'fix: resolve issue';
-      } else if (fileName.match(/feat|feature|add/i)) {
-        title = 'feat: add feature';
-      } else if (baseName.match(/^[A-Z]/)) {
-        // Capitalized files often indicate new components/features
-        title = `feat: add ${baseName}`;
-      } else {
-        title = `chore: update ${baseName || fileName}`;
-      }
-    }
-
-    // Generate description from commits and files
-    const descriptionParts: string[] = [];
-
-    // Extract diff stats first
-    let fileCount = 0;
-    let insertions = 0;
-    let deletions = 0;
-    if (diff) {
-      const statsMatch = diff.match(
-        /(\d+)\s+files? changed(?:,\s+(\d+)\s+insertions?\(\+\))?(?:,\s+(\d+)\s+deletions?\(-\))?/
-      );
-      if (statsMatch) {
-        fileCount = parseInt(statsMatch[1] || '0', 10) || 0;
-        insertions = parseInt(statsMatch[2] || '0', 10) || 0;
-        deletions = parseInt(statsMatch[3] || '0', 10) || 0;
-      }
-    }
-    // Fallback to changedFiles length if no diff stats
-    if (fileCount === 0 && changedFiles.length > 0) {
-      fileCount = changedFiles.length;
-    }
-
-    // Add commits section if available
-    if (commits.length > 0) {
-      descriptionParts.push('## Changes');
-      commits.forEach((commit) => {
-        descriptionParts.push(`- ${commit}`);
-      });
-    }
-
-    // Add files section - only show if more than 1 file or if we have detailed stats
-    if (changedFiles.length > 0) {
-      if (changedFiles.length === 1 && fileCount === 1) {
-        // Single file: include it inline with summary
-        descriptionParts.push('\n## Summary');
-        descriptionParts.push(`- Updated \`${changedFiles[0]}\``);
-        if (insertions > 0 || deletions > 0) {
-          const changes: string[] = [];
-          if (insertions > 0) changes.push(`+${insertions}`);
-          if (deletions > 0) changes.push(`-${deletions}`);
-          if (changes.length > 0) {
-            descriptionParts.push(`- ${changes.join(', ')} lines`);
-          }
-        }
-      } else {
-        // Multiple files: show list
-        descriptionParts.push('\n## Files Changed');
-        changedFiles.slice(0, 20).forEach((file) => {
-          descriptionParts.push(`- \`${file}\``);
-        });
-        if (changedFiles.length > 20) {
-          descriptionParts.push(`\n... and ${changedFiles.length - 20} more files`);
-        }
-
-        // Add summary stats if available
-        if (fileCount > 0 || insertions > 0 || deletions > 0) {
-          descriptionParts.push('\n## Summary');
-          if (fileCount > 0) {
-            descriptionParts.push(`- ${fileCount} file${fileCount !== 1 ? 's' : ''} changed`);
-          }
-          if (insertions > 0 || deletions > 0) {
-            const changes: string[] = [];
-            if (insertions > 0) changes.push(`+${insertions}`);
-            if (deletions > 0) changes.push(`-${deletions}`);
-            descriptionParts.push(`- ${changes.join(', ')} lines`);
-          }
-        }
-      }
-    } else if (fileCount > 0 || insertions > 0 || deletions > 0) {
-      // No file list but we have stats
-      descriptionParts.push('\n## Summary');
-      if (fileCount > 0) {
-        descriptionParts.push(`- ${fileCount} file${fileCount !== 1 ? 's' : ''} changed`);
-      }
-      if (insertions > 0 || deletions > 0) {
-        const changes: string[] = [];
-        if (insertions > 0) changes.push(`+${insertions}`);
-        if (deletions > 0) changes.push(`-${deletions}`);
-        descriptionParts.push(`- ${changes.join(', ')} lines`);
-      }
-    }
-
-    const description = descriptionParts.join('\n') || 'No description available.';
-
-    return { title, description };
-  }
-
-  /**
-   * Generate fallback content when no context is available
-   */
-  private generateFallbackContent(changedFiles: string[]): GeneratedPrContent {
-    const title =
-      changedFiles.length > 0
-        ? `chore: update ${changedFiles[0].split('/').pop() || 'files'}`
-        : 'chore: update code';
-
-    const description =
-      changedFiles.length > 0
-        ? `Updated ${changedFiles.length} file${changedFiles.length !== 1 ? 's' : ''}.`
-        : 'No changes detected.';
-
-    return { title, description };
-  }
-
-  /**
-   * Normalize markdown formatting to ensure proper structure
-   */
-  private normalizeMarkdown(text: string): string {
-    if (!text) return text;
-
-    // Ensure headers have proper spacing (double newline before headers)
-    let normalized = text.replace(/\n(##+ )/g, '\n\n$1');
-
-    // Remove excessive blank lines (more than 2 consecutive)
-    normalized = normalized.replace(/\n{3,}/g, '\n\n');
-
-    // Trim trailing whitespace on each line but preserve intentional spacing
-    normalized = normalized
-      .split('\n')
-      .map((line) => line.trimEnd())
-      .join('\n');
-
-    return normalized.trim();
-  }
-
-  /**
-   * Check if a string is a valid provider ID
-   */
-  private isValidProviderId(id: string): id is ProviderId {
-    return PROVIDER_IDS.includes(id as ProviderId);
   }
 }
 

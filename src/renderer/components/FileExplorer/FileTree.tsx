@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { FileIcon } from './FileIcons';
 import { useContentSearch } from '@/hooks/useContentSearch';
 import { SearchInput } from './SearchInput';
 import { ContentSearchResults } from './ContentSearchResults';
+import { getEditorState, saveEditorState } from '@/lib/editorStateStorage';
 import type { FileChange } from '@/hooks/useFileChanges';
 
 export interface FileNode {
@@ -18,7 +19,26 @@ export interface FileNode {
   isLoaded?: boolean;
 }
 
+export const constructSubRoot = (rootPath: string, nodePath: string): string => {
+  const separator = rootPath.includes('\\') ? '\\' : '/';
+  return rootPath.endsWith(separator)
+    ? `${rootPath}${nodePath}`
+    : `${rootPath}${separator}${nodePath}`;
+};
+
+function findNode(nodes: FileNode[], path: string): FileNode | null {
+  for (const n of nodes) {
+    if (n.path === path) return n;
+    if (n.children?.length) {
+      const found = findNode(n.children, path);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 interface FileTreeProps {
+  taskId: string;
   rootPath: string;
   selectedFile?: string | null;
   onSelectFile: (path: string) => void;
@@ -144,6 +164,7 @@ const TreeNode: React.FC<{
 };
 
 export const FileTree: React.FC<FileTreeProps> = ({
+  taskId,
   rootPath,
   selectedFile,
   onSelectFile,
@@ -156,10 +177,15 @@ export const FileTree: React.FC<FileTreeProps> = ({
   remotePath,
 }) => {
   const [tree, setTree] = useState<FileNode[]>([]);
-  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => {
+    const state = getEditorState(taskId);
+    return new Set(state?.expandedPaths ?? []);
+  });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [allFiles, setAllFiles] = useState<any[]>([]);
+  const restoringRef = useRef(true);
+  const loadingPathsRef = useRef(new Set<string>());
 
   // Use the clean content search hook
   const {
@@ -173,7 +199,6 @@ export const FileTree: React.FC<FileTreeProps> = ({
 
   const defaultExcludePatterns = useMemo(
     () => [
-      'node_modules',
       '.git',
       'dist',
       'build',
@@ -227,7 +252,17 @@ export const FileTree: React.FC<FileTreeProps> = ({
         const lowerPart = part.toLowerCase();
         return allExcludePatterns.some((pattern) => {
           const lowerPattern = pattern.toLowerCase();
-          return lowerPart === lowerPattern || lowerPart.includes(lowerPattern);
+
+          // Handle glob patterns (simplistic version)
+          if (lowerPattern.includes('*')) {
+            // Convert glob to regex: . -> \., * -> .*
+            const regexStr = '^' + lowerPattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$';
+            return (
+              new RegExp(regexStr).test(lowerPart) || new RegExp(regexStr).test(path.toLowerCase())
+            );
+          }
+
+          return lowerPart === lowerPattern;
         });
       });
     },
@@ -339,7 +374,10 @@ export const FileTree: React.FC<FileTreeProps> = ({
           opts.remotePath = remotePath;
         }
 
-        const result = await window.electronAPI.fsList(rootPath, opts);
+        const result = await window.electronAPI.fsList(rootPath, {
+          ...opts,
+          recursive: false,
+        });
 
         if (result.canceled) {
           return;
@@ -398,31 +436,95 @@ export const FileTree: React.FC<FileTreeProps> = ({
     });
   }, [allFiles, buildNodesFromPath]); // Rebuild tree when files or filter function changes
 
-  // Load children for a node using the cached file list
+  // Load children for a node
   const loadChildren = useCallback(
     async (node: FileNode) => {
-      const children = buildNodesFromPath(node.path, allFiles);
+      // If already loaded, just toggle (handled by click handler, but nice to be safe)
+      if (node.isLoaded) return;
 
-      setTree((currentTree) => {
-        const updateNode = (nodes: FileNode[]): FileNode[] => {
-          return nodes.map((n) => {
-            if (n.path === node.path) {
-              return { ...n, children, isLoaded: true };
-            }
-            if (n.children && n.children.length > 0) {
-              return { ...n, children: updateNode(n.children) };
-            }
-            return n;
-          });
+      try {
+        const subRoot = constructSubRoot(rootPath, node.path);
+
+        const opts: {
+          includeDirs: boolean;
+          recursive: boolean;
+          connectionId?: string;
+          remotePath?: string;
+        } = {
+          includeDirs: true,
+          recursive: false,
         };
+        if (connectionId && remotePath) {
+          opts.connectionId = connectionId;
+          opts.remotePath = remotePath;
+        }
 
-        return updateNode(currentTree);
-      });
+        const result = await window.electronAPI.fsList(subRoot, opts);
+
+        if (result.success && result.items) {
+          // Process new items:
+          // 1. Prefix their paths so they are relative to project root
+          // 2. Add them to allFiles
+          const newItems = result.items.map((item: any) => ({
+            ...item,
+            path: `${node.path}/${item.path}`, // item.path from fsList is relative to subRoot
+          }));
+
+          setAllFiles((prev) => {
+            // Remove any existing children of this node to avoid duplicates (optional but good)
+            const filtered = prev.filter((p) => !p.path.startsWith(node.path + '/'));
+            return [...filtered, ...newItems];
+          });
+
+          // Mark node as loaded to prevent re-fetching and allow expansion
+          setTree((currentTree) => {
+            const updateNode = (nodes: FileNode[]): FileNode[] => {
+              return nodes.map((n) => {
+                if (n.path === node.path) {
+                  return { ...n, isLoaded: true };
+                }
+                if (n.children && n.children.length > 0) {
+                  return { ...n, children: updateNode(n.children) };
+                }
+                return n;
+              });
+            };
+            return updateNode(currentTree);
+          });
+        }
+      } catch (error) {
+        console.error('Failed to load children', error);
+      }
     },
-    [allFiles, buildNodesFromPath]
+    [rootPath, connectionId, remotePath]
   );
 
-  // Toggle expand/collapse
+  useEffect(() => {
+    restoringRef.current = true;
+    const state = getEditorState(taskId);
+    setExpandedPaths(new Set(state?.expandedPaths ?? []));
+  }, [taskId]);
+
+  useEffect(() => {
+    if (expandedPaths.size === 0 || tree.length === 0) return;
+    const paths = [...expandedPaths].sort(
+      (a, b) => a.split('/').filter(Boolean).length - b.split('/').filter(Boolean).length
+    );
+    const path = paths.find((p) => {
+      if (loadingPathsRef.current.has(p)) return false;
+      const node = findNode(tree, p);
+      return node?.type === 'directory' && !node.isLoaded;
+    });
+    if (!path) return;
+    const node = findNode(tree, path);
+    if (node) {
+      loadingPathsRef.current.add(path);
+      void loadChildren(node).finally(() => {
+        loadingPathsRef.current.delete(path);
+      });
+    }
+  }, [taskId, tree, expandedPaths, loadChildren]);
+
   const handleToggleExpand = useCallback((path: string) => {
     setExpandedPaths((prev) => {
       const next = new Set(prev);
@@ -434,6 +536,15 @@ export const FileTree: React.FC<FileTreeProps> = ({
       return next;
     });
   }, []);
+
+  // Persist expandedPaths to localStorage (skip during restore)
+  useEffect(() => {
+    if (restoringRef.current) {
+      restoringRef.current = false;
+      return;
+    }
+    saveEditorState(taskId, { expandedPaths: Array.from(expandedPaths) });
+  }, [taskId, expandedPaths]);
 
   // Handle clicking on a search result
   const handleSearchResultClick = useCallback(

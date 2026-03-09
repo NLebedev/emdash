@@ -55,6 +55,16 @@ declare global {
         error?: string;
       }>;
       ptyClearSnapshot: (args: { id: string }) => Promise<{ ok: boolean }>;
+      ptyCleanupSessions: (args: {
+        ids: string[];
+        clearSnapshots?: boolean;
+        waitForSnapshots?: boolean;
+      }) => Promise<{
+        ok: boolean;
+        cleaned: number;
+        failedIds: string[];
+        snapshotClearQueued: boolean;
+      }>;
       onPtyExit: (
         id: string,
         listener: (info: { exitCode: number; signal?: number }) => void
@@ -107,8 +117,30 @@ declare global {
         needsBaseRefSwitch?: boolean;
         error?: string;
       }>;
+      worktreeClaimReserveAndSaveTask: (args: {
+        projectId: string;
+        projectPath: string;
+        taskName: string;
+        baseRef?: string;
+        task: {
+          projectId: string;
+          name: string;
+          status: 'active' | 'idle' | 'running';
+          agentId?: string | null;
+          metadata?: any;
+          useWorktree?: boolean;
+        };
+      }) => Promise<{
+        success: boolean;
+        worktree?: any;
+        task?: any;
+        needsBaseRefSwitch?: boolean;
+        error?: string;
+      }>;
       worktreeRemoveReserve: (args: {
         projectId: string;
+        projectPath?: string;
+        isRemote?: boolean;
       }) => Promise<{ success: boolean; error?: string }>;
 
       // Lifecycle scripts
@@ -120,11 +152,13 @@ declare global {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
       lifecycleRunStart: (args: {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
       lifecycleRunStop: (args: {
         taskId: string;
@@ -133,6 +167,7 @@ declare global {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
       lifecycleGetState: (args: { taskId: string }) => Promise<{
         success: boolean;
@@ -161,6 +196,11 @@ declare global {
             error?: string | null;
           };
         };
+        error?: string;
+      }>;
+      lifecycleGetLogs: (args: { taskId: string }) => Promise<{
+        success: boolean;
+        logs?: { setup: string[]; run: string[]; teardown: string[] };
         error?: string;
       }>;
       lifecycleClearTask: (args: {
@@ -213,6 +253,32 @@ declare global {
           unstagedDeletions: number;
           diff?: string;
         }>;
+        error?: string;
+      }>;
+      getDeleteRisks: (args: {
+        targets: Array<{ id: string; taskPath: string }>;
+        includePr?: boolean;
+      }) => Promise<{
+        success: boolean;
+        risks?: Record<
+          string,
+          {
+            staged: number;
+            unstaged: number;
+            untracked: number;
+            ahead: number;
+            behind: number;
+            error?: string;
+            pr?: {
+              number?: number;
+              title?: string;
+              url?: string;
+              state?: string | null;
+              isDraft?: boolean;
+            } | null;
+            prKnown: boolean;
+          }
+        >;
         error?: string;
       }>;
       watchGitStatus: (taskPath: string) => Promise<{
@@ -327,8 +393,6 @@ declare global {
         error?: string;
       }>;
       githubLogout: () => Promise<void>;
-      getSettings: () => Promise<any>;
-      updateSettings: (settings: any) => Promise<void>;
       linearCheckConnection?: () => Promise<{
         connected: boolean;
         taskName?: string;
@@ -355,13 +419,6 @@ declare global {
         issues?: any[];
         error?: string;
       }>;
-      // Database methods
-      getProjects: () => Promise<any[]>;
-      saveProject: (project: any) => Promise<{ success: boolean; error?: string }>;
-      getTasks: (projectId?: string) => Promise<any[]>;
-      saveTask: (task: any) => Promise<{ success: boolean; error?: string }>;
-      deleteProject: (projectId: string) => Promise<{ success: boolean; error?: string }>;
-      deleteTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
     };
   }
 }

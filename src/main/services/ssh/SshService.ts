@@ -7,6 +7,8 @@ import { quoteShellArg } from '../../utils/shellEscape';
 import { readFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
+import { spawn, ChildProcess } from 'child_process';
+import { resolveIdentityAgent, resolveProxyCommand } from '../../utils/sshConfigParser';
 
 /** Maximum number of concurrent SSH connections allowed in the pool. */
 const MAX_CONNECTIONS = 10;
@@ -26,6 +28,7 @@ const POOL_WARNING_THRESHOLD = 0.8;
 export class SshService extends EventEmitter {
   private connections: ConnectionPool = {};
   private pendingConnections: Map<string, Promise<string>> = new Map();
+  private proxyProcesses: Map<string, ChildProcess> = new Map();
   private credentialService: SshCredentialService;
 
   constructor(credentialService?: SshCredentialService) {
@@ -94,6 +97,16 @@ export class SshService extends EventEmitter {
     return new Promise((resolve, reject) => {
       // Handle connection errors
       client.on('error', (err: Error) => {
+        // Clean up any proxy process for this failed connection
+        const proxyProc = this.proxyProcesses.get(connectionId);
+        if (proxyProc) {
+          try {
+            proxyProc.kill();
+          } catch {
+            /* ignore */
+          }
+          this.proxyProcesses.delete(connectionId);
+        }
         reject(err);
       });
 
@@ -104,6 +117,15 @@ export class SshService extends EventEmitter {
         // that was established under the same connectionId.
         if (this.connections[connectionId]?.client === client) {
           delete this.connections[connectionId];
+          const proxyProc = this.proxyProcesses.get(connectionId);
+          if (proxyProc) {
+            try {
+              proxyProc.kill();
+            } catch {
+              /* ignore */
+            }
+            this.proxyProcesses.delete(connectionId);
+          }
           this.emit('disconnected', connectionId);
         }
       });
@@ -126,6 +148,12 @@ export class SshService extends EventEmitter {
       // Build connection config
       this.buildConnectConfig(connectionId, config)
         .then((connectConfig) => {
+          // Track proxy process for cleanup on disconnect
+          const proxyProc = (connectConfig as any)._proxyProcess as ChildProcess | undefined;
+          if (proxyProc) {
+            this.proxyProcesses.set(connectionId, proxyProc);
+            delete (connectConfig as any)._proxyProcess;
+          }
           client.connect(connectConfig);
         })
         .catch((err) => {
@@ -155,6 +183,31 @@ export class SshService extends EventEmitter {
       keepaliveInterval: 60000,
       keepaliveCountMax: 3,
     };
+
+    // Check for ProxyCommand in ~/.ssh/config
+    const proxyCommand = await resolveProxyCommand(config.host, config.port);
+    if (proxyCommand) {
+      const { Duplex } = await import('stream');
+      const proxyProc = spawn('sh', ['-c', proxyCommand], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      // Create a duplex stream bridging proxy stdout (read) and stdin (write)
+      const sock = new Duplex({
+        read() {},
+        write(chunk, encoding, callback) {
+          return proxyProc.stdin!.write(chunk, encoding, callback);
+        },
+        final(callback) {
+          proxyProc.stdin!.end(callback);
+        },
+      });
+      proxyProc.stdout!.on('data', (data) => sock.push(data));
+      proxyProc.stdout!.on('close', () => sock.push(null));
+      proxyProc.on('error', (err) => sock.destroy(err));
+
+      (connectConfig as any).sock = sock;
+      (connectConfig as any)._proxyProcess = proxyProc;
+    }
 
     switch (config.authType) {
       case 'password': {
@@ -198,15 +251,17 @@ export class SshService extends EventEmitter {
       }
 
       case 'agent': {
-        const agentSocket = process.env.SSH_AUTH_SOCK;
+        const identityAgent = await resolveIdentityAgent(config.host);
+        const agentSocket = identityAgent || process.env.SSH_AUTH_SOCK;
         if (!agentSocket) {
           throw new Error(
-            'SSH agent authentication failed: SSH_AUTH_SOCK environment variable is not set. ' +
+            'SSH agent authentication failed: no agent socket found. ' +
               'This typically happens when:\n' +
               '1. The SSH agent is not running (try running "eval $(ssh-agent -s)" in your terminal)\n' +
               '2. The app was launched from the GUI (Finder/Dock) instead of a terminal\n' +
               '3. The SSH agent socket path could not be auto-detected\n\n' +
               'Workarounds:\n' +
+              '• Add IdentityAgent to this host in ~/.ssh/config (e.g. for 1Password)\n' +
               '• Launch Emdash from your terminal where SSH agent is already configured\n' +
               '• Use SSH key authentication instead of agent authentication\n' +
               '• Ensure your SSH agent is running and your keys are added (ssh-add -l)'
@@ -255,6 +310,17 @@ export class SshService extends EventEmitter {
     // Close SSH client
     connection.client.end();
 
+    // Kill proxy process if one was used
+    const proxyProc = this.proxyProcesses.get(connectionId);
+    if (proxyProc) {
+      try {
+        proxyProc.kill();
+      } catch {
+        /* ignore */
+      }
+      this.proxyProcesses.delete(connectionId);
+    }
+
     // Remove from pool
     delete this.connections[connectionId];
 
@@ -278,8 +344,11 @@ export class SshService extends EventEmitter {
     // Update last activity
     connection.lastActivity = new Date();
 
-    // Build the command with optional cwd
-    const fullCommand = cwd ? `cd ${quoteShellArg(cwd)} && ${command}` : command;
+    // Build the command with optional cwd, wrapped in a login shell so that
+    // ~/.ssh/config, ~/.gitconfig, and other user-level configuration files
+    // are available (ssh2's client.exec() uses a non-login shell by default).
+    const innerCommand = cwd ? `cd ${quoteShellArg(cwd)} && ${command}` : command;
+    const fullCommand = `bash -l -c ${quoteShellArg(innerCommand)}`;
 
     return new Promise((resolve, reject) => {
       connection.client.exec(fullCommand, (err, stream) => {

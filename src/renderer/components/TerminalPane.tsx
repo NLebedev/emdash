@@ -2,10 +2,10 @@ import React, {
   useEffect,
   useRef,
   useMemo,
-  useCallback,
-  useState,
   forwardRef,
   useImperativeHandle,
+  useState,
+  useCallback,
 } from 'react';
 import { terminalSessionRegistry } from '../terminal/SessionRegistry';
 import type { SessionTheme } from '../terminal/TerminalSessionManager';
@@ -24,27 +24,22 @@ const sendEscapedPathsToPty = (ptyId: string, paths: string[]) => {
 type Props = {
   id: string;
   cwd?: string;
-  remote?: {
-    connectionId: string;
-  };
-  providerId?: string; // If set, uses direct CLI spawn (no shell)
-  shell?: string; // Used for shell-based spawn when providerId not set
-  cols?: number;
-  rows?: number;
-  env?: Record<string, string>;
-  className?: string;
-  variant?: 'dark' | 'light';
-  themeOverride?: any;
-  contentFilter?: string;
-  keepAlive?: boolean;
+  remote?: { connectionId: string };
+  providerId?: string;
   autoApprove?: boolean;
-  initialPrompt?: string;
+  env?: Record<string, string>;
+  keepAlive?: boolean;
   mapShiftEnterToCtrlJ?: boolean;
-  disableSnapshots?: boolean; // If true, don't save/restore terminal snapshots (for non-main chats)
+  disableSnapshots?: boolean;
   onActivity?: () => void;
   onStartError?: (message: string) => void;
   onStartSuccess?: () => void;
-  onExit?: (info: { exitCode: number | undefined; signal?: number }) => void;
+  variant?: 'light' | 'dark';
+  themeOverride?: SessionTheme;
+  contentFilter?: string;
+  initialPrompt?: string;
+  onFirstMessage?: (message: string) => void;
+  className?: string;
 };
 
 const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
@@ -54,169 +49,132 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
       cwd,
       remote,
       providerId,
-      cols = 120,
-      rows = 32,
-      shell,
+      autoApprove = false,
       env,
-      className,
-      variant = 'dark',
-      themeOverride,
-      contentFilter,
-      keepAlive = true,
-      autoApprove,
-      initialPrompt,
-      mapShiftEnterToCtrlJ,
+      keepAlive = false,
+      mapShiftEnterToCtrlJ = false,
       disableSnapshots = false,
       onActivity,
       onStartError,
       onStartSuccess,
-      onExit,
+      variant = 'dark',
+      themeOverride,
+      contentFilter,
+      initialPrompt,
+      onFirstMessage,
+      className,
     },
     ref
   ) => {
-    const containerRef = useRef<HTMLDivElement | null>(null);
-    const sessionRef = useRef<ReturnType<(typeof terminalSessionRegistry)['attach']> | null>(null);
-    const activityCleanupRef = useRef<(() => void) | null>(null);
-    const readyCleanupRef = useRef<(() => void) | null>(null);
-    const errorCleanupRef = useRef<(() => void) | null>(null);
-    const exitCleanupRef = useRef<(() => void) | null>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
+    const sessionCreatedRef = useRef(false);
+    const terminalIdRef = useRef(id);
+    const remoteRef = useRef(remote);
+    const onStartSuccessRef = useRef(onStartSuccess);
+    const onStartErrorRef = useRef(onStartError);
+    const initialPromptRef = useRef(initialPrompt);
+    const onFirstMessageRef = useRef(onFirstMessage);
 
-    // State for external link modal
-    const [linkModalOpen, setLinkModalOpen] = useState(false);
-    const [currentLinkUrl, setCurrentLinkUrl] = useState('');
+    // Keep refs in sync so effects don't need to re-run on prop change
+    useEffect(() => {
+      terminalIdRef.current = id;
+      remoteRef.current = remote;
+      onStartSuccessRef.current = onStartSuccess;
+      onStartErrorRef.current = onStartError;
+      initialPromptRef.current = initialPrompt;
+      onFirstMessageRef.current = onFirstMessage;
+    });
 
-    // Handle link clicks from terminal
-    const handleLinkClick = useCallback((url: string) => {
-      setCurrentLinkUrl(url);
-      setLinkModalOpen(true);
-    }, []);
-
-    // Handle confirming link open
-    const handleLinkConfirm = useCallback(() => {
-      if (currentLinkUrl) {
-        window.electronAPI.openExternal(currentLinkUrl).catch((error) => {
-          log.warn('Failed to open external link', { url: currentLinkUrl, error });
-        });
-      }
-      setLinkModalOpen(false);
-      setCurrentLinkUrl('');
-    }, [currentLinkUrl]);
-
-    // Handle cancelling link open
-    const handleLinkCancel = useCallback(() => {
-      setLinkModalOpen(false);
-      setCurrentLinkUrl('');
-    }, []);
-
-    const theme = useMemo<SessionTheme>(
-      () => ({ base: variant, override: themeOverride }),
-      [variant, themeOverride]
-    );
-
-    // Expose focus method via ref
-    useImperativeHandle(
-      ref,
-      () => ({
-        focus: () => {
-          sessionRef.current?.focus();
-        },
-      }),
-      []
-    );
+    useImperativeHandle(ref, () => ({
+      focus: () => {
+        const session = terminalSessionRegistry.getSession(terminalIdRef.current);
+        if (session) {
+          session.focus();
+        }
+      },
+    }));
 
     useEffect(() => {
+      const ptyId = id;
       const container = containerRef.current;
       if (!container) return;
 
-      const session = terminalSessionRegistry.attach({
-        taskId: id,
-        container,
-        cwd,
-        remote,
-        providerId,
-        shell,
-        env,
-        initialSize: { cols, rows },
-        theme,
-        autoApprove,
-        initialPrompt,
-        mapShiftEnterToCtrlJ,
-        disableSnapshots,
-        onLinkClick: handleLinkClick,
-      });
-      sessionRef.current = session;
+      const setupSession = async () => {
+        try {
+          const session = await terminalSessionRegistry.getOrCreateSession(ptyId, {
+            cwd,
+            remote: remoteRef.current,
+            providerId,
+            autoApprove,
+            env,
+            keepAlive,
+            mapShiftEnterToCtrlJ,
+            disableSnapshots,
+            onActivity,
+            initialPrompt: initialPromptRef.current,
+            onFirstMessage: (msg) => onFirstMessageRef.current?.(msg),
+          });
 
-      if (onActivity) {
-        activityCleanupRef.current = session.registerActivityListener(onActivity);
-      }
+          if (!container) return;
+          session.attach(container, {
+            variant,
+            themeOverride,
+          });
+          onStartSuccessRef.current?.();
+        } catch (error) {
+          log.error('[TerminalPane] failed to create session', error);
+          onStartErrorRef.current?.(error instanceof Error ? error.message : String(error));
+        }
+      };
 
-      if (onStartSuccess) {
-        readyCleanupRef.current = session.registerReadyListener(onStartSuccess);
-      }
-      if (onStartError) {
-        errorCleanupRef.current = session.registerErrorListener(onStartError);
-      }
-      if (onExit) {
-        exitCleanupRef.current = session.registerExitListener(onExit);
+      if (!sessionCreatedRef.current) {
+        sessionCreatedRef.current = true;
+        setupSession();
+      } else {
+        const session = terminalSessionRegistry.getSession(ptyId);
+        if (session) {
+          session.attach(container, {
+            variant,
+            themeOverride,
+          });
+        }
       }
 
       return () => {
-        activityCleanupRef.current?.();
-        activityCleanupRef.current = null;
-        readyCleanupRef.current?.();
-        readyCleanupRef.current = null;
-        errorCleanupRef.current?.();
-        errorCleanupRef.current = null;
-        exitCleanupRef.current?.();
-        exitCleanupRef.current = null;
-        terminalSessionRegistry.detach(id);
+        const session = terminalSessionRegistry.getSession(ptyId);
+        if (session) {
+          session.detach();
+        }
       };
     }, [
       id,
       cwd,
-      remote,
       providerId,
-      shell,
-      env,
-      cols,
-      rows,
-      theme,
       autoApprove,
-      initialPrompt,
+      env,
+      keepAlive,
       mapShiftEnterToCtrlJ,
-      handleLinkClick,
+      disableSnapshots,
       onActivity,
-      onStartError,
-      onStartSuccess,
-      onExit,
+      variant,
+      themeOverride,
     ]);
 
+    // Track active terminal state for context injection
     useEffect(() => {
+      const ptyId = id;
+      window.dispatchEvent(new CustomEvent('emdash:terminal:active', { detail: { ptyId } }));
       return () => {
-        activityCleanupRef.current?.();
-        activityCleanupRef.current = null;
-        readyCleanupRef.current?.();
-        readyCleanupRef.current = null;
-        errorCleanupRef.current?.();
-        errorCleanupRef.current = null;
-        exitCleanupRef.current?.();
-        exitCleanupRef.current = null;
-        if (!keepAlive) {
-          terminalSessionRegistry.dispose(id);
-        }
+        window.dispatchEvent(new CustomEvent('emdash:terminal:inactive', { detail: { ptyId } }));
       };
-    }, [id, keepAlive]);
+    }, [id]);
 
-    const handleFocus = () => {
-      void (async () => {
-        const { captureTelemetry } = await import('../lib/telemetryClient');
-        captureTelemetry('terminal_entered');
-      })();
-      // Focus the terminal session
-      sessionRef.current?.focus();
+    const handleDragOver = (event: React.DragEvent) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
     };
 
-    const handleDrop: React.DragEventHandler<HTMLDivElement> = async (event) => {
+    const handleDrop = async (event: React.DragEvent) => {
       try {
         event.preventDefault();
         const dt = event.dataTransfer;
@@ -226,71 +184,63 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
         );
         if (paths.length === 0) return;
 
-        if (remote?.connectionId) {
+        if (remoteRef.current?.connectionId) {
           // SSH terminal: transfer files to remote first via scp
           try {
             const result = await window.electronAPI.ptyScpToRemote({
-              connectionId: remote.connectionId,
+              id: terminalIdRef.current,
               localPaths: paths,
             });
             if (result.success && result.remotePaths) {
-              const remotePaths = result.remotePaths.filter((path): path is string =>
-                Boolean(path)
-              );
-              sendEscapedPathsToPty(id, remotePaths);
+              sendEscapedPathsToPty(terminalIdRef.current, result.remotePaths);
+            } else if (result.error) {
+              log.error('[TerminalPane] SCP failed', result.error);
             }
-          } catch (error) {
-            log.warn('SSH file transfer failed', { error });
+          } catch (err) {
+            log.error('[TerminalPane] SCP exception', err);
           }
         } else {
-          // Local terminal: send local path directly
-          sendEscapedPathsToPty(id, paths);
+          // Local terminal: send local paths
+          sendEscapedPathsToPty(terminalIdRef.current, paths);
         }
-        sessionRef.current?.focus();
-      } catch (error) {
-        log.warn('Terminal drop failed', { error });
+      } catch (err) {
+        log.error('[TerminalPane] onDrop failed', err);
       }
     };
 
+    const [externalLink, setExternalLink] = useState<string | null>(null);
+
+    const handleExternalLink = useCallback((event: Event) => {
+      const customEvent = event as CustomEvent<{ url: string; ptyId: string }>;
+      if (customEvent.detail?.ptyId === terminalIdRef.current) {
+        setExternalLink(customEvent.detail.url);
+      }
+    }, []);
+
+    useEffect(() => {
+      window.addEventListener('emdash:terminal:external-link', handleExternalLink);
+      return () => {
+        window.removeEventListener('emdash:terminal:external-link', handleExternalLink);
+      };
+    }, [handleExternalLink]);
+
     return (
-      <>
+      <div
+        className={cn('relative flex h-full w-full flex-col overflow-hidden', className)}
+        onDragOver={handleDragOver}
+        onDrop={handleDrop}
+      >
         <div
-          className={['terminal-pane flex h-full w-full min-w-0', className]
-            .filter(Boolean)
-            .join(' ')}
-          style={{
-            width: '100%',
-            height: '100%',
-            minHeight: 0,
-            backgroundColor:
-              variant === 'light' ? '#ffffff' : themeOverride?.background || '#1f2937',
-            boxSizing: 'border-box',
-          }}
-        >
-          <div
-            ref={containerRef}
-            data-terminal-container
-            style={{
-              width: '100%',
-              height: '100%',
-              minHeight: 0,
-              overflow: 'hidden',
-              filter: contentFilter || undefined,
-            }}
-            onClick={handleFocus}
-            onMouseDown={handleFocus}
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={handleDrop}
-          />
-        </div>
-        <ExternalLinkModal
-          open={linkModalOpen}
-          onOpenChange={setLinkModalOpen}
-          url={currentLinkUrl}
-          onConfirm={handleLinkConfirm}
-          onCancel={handleLinkCancel}
+          ref={containerRef}
+          className="h-full w-full bg-inherit"
+          style={{ filter: contentFilter }}
         />
-      </>
+        <ExternalLinkModal
+          url={externalLink || ''}
+          isOpen={!!externalLink}
+          onClose={() => setExternalLink(null)}
+        />
+      </div>
     );
   }
 );
@@ -298,5 +248,3 @@ const TerminalPaneComponent = forwardRef<{ focus: () => void }, Props>(
 TerminalPaneComponent.displayName = 'TerminalPane';
 
 export const TerminalPane = React.memo(TerminalPaneComponent);
-
-export default TerminalPane;

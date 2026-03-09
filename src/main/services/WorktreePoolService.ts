@@ -30,6 +30,7 @@ interface ClaimResult {
  * 3. Replenishing the pool in the background after claims
  */
 export class WorktreePoolService {
+  // Keyed by `${projectId}::${baseRef}` to keep reserves base-ref specific.
   private reserves = new Map<string, ReserveWorktree>();
   private creationInProgress = new Set<string>();
   private readonly RESERVE_PREFIX = '_reserve';
@@ -72,6 +73,57 @@ export class WorktreePoolService {
     return `${this.RESERVE_PREFIX}/${hash}`;
   }
 
+  private normalizeBaseRef(baseRef?: string): string {
+    const trimmed = (baseRef || '').trim();
+    return trimmed.length > 0 ? trimmed : 'HEAD';
+  }
+
+  private getReserveKey(projectId: string, baseRef?: string): string {
+    return `${projectId}::${this.normalizeBaseRef(baseRef)}`;
+  }
+
+  private async refreshRefsForReserveCreation(
+    projectPath: string,
+    projectId: string
+  ): Promise<void> {
+    try {
+      await this.execGit(['fetch', '--all', '--prune'], projectPath, 15000);
+    } catch (error) {
+      log.warn('WorktreePool: Failed to refresh refs during reserve creation', {
+        projectId,
+        error,
+      });
+    }
+  }
+
+  /**
+   * Resolve HEAD or bare branch names to their remote tracking counterpart.
+   * After `refreshRefsForReserveCreation` fetches all refs, this ensures the
+   * worktree is created from the freshly-fetched remote ref rather than a
+   * potentially stale local branch.
+   */
+  private async resolveToRemoteRef(projectPath: string, baseRef: string): Promise<string> {
+    // Already a remote tracking ref — use as-is
+    if (baseRef.startsWith('origin/')) return baseRef;
+
+    try {
+      const { stdout: branchOut } =
+        baseRef === 'HEAD'
+          ? await this.execGit(['symbolic-ref', '--short', 'HEAD'], projectPath)
+          : { stdout: baseRef };
+      const branchName = branchOut.trim();
+
+      // Verify the remote tracking ref exists (it should after fetch --all)
+      await this.execGit(
+        ['rev-parse', '--verify', `refs/remotes/origin/${branchName}`],
+        projectPath
+      );
+      return `origin/${branchName}`;
+    } catch {
+      return baseRef; // Fallback to original if resolution fails
+    }
+  }
+
   /** Generate stable ID from path */
   private stableIdFromPath(worktreePath: string): string {
     const abs = path.resolve(worktreePath);
@@ -87,16 +139,30 @@ export class WorktreePoolService {
 
   /** Check if a fresh reserve exists for a project */
   hasReserve(projectId: string): boolean {
-    const reserve = this.reserves.get(projectId);
-    if (!reserve) return false;
-    // Don't count stale reserves
-    if (this.isReserveStale(reserve)) return false;
-    return true;
+    for (const [key, reserve] of this.reserves.entries()) {
+      if (!key.startsWith(`${projectId}::`)) continue;
+      if (this.isReserveStale(reserve)) {
+        this.reserves.delete(key);
+        this.cleanupReserve(reserve).catch(() => {});
+        continue;
+      }
+      return true;
+    }
+    return false;
   }
 
   /** Get the reserve for a project (if any) */
   getReserve(projectId: string): ReserveWorktree | undefined {
-    return this.reserves.get(projectId);
+    for (const [key, reserve] of this.reserves.entries()) {
+      if (!key.startsWith(`${projectId}::`)) continue;
+      if (this.isReserveStale(reserve)) {
+        this.reserves.delete(key);
+        this.cleanupReserve(reserve).catch(() => {});
+        continue;
+      }
+      return reserve;
+    }
+    return undefined;
   }
 
   /**
@@ -104,31 +170,33 @@ export class WorktreePoolService {
    * Creates one in the background if not present.
    */
   async ensureReserve(projectId: string, projectPath: string, baseRef?: string): Promise<void> {
+    const reserveKey = this.getReserveKey(projectId, baseRef);
+
     // Creation already in progress
-    if (this.creationInProgress.has(projectId)) {
+    if (this.creationInProgress.has(reserveKey)) {
       return;
     }
 
     // Check existing reserve
-    const existing = this.reserves.get(projectId);
+    const existing = this.reserves.get(reserveKey);
     if (existing) {
       if (!this.isReserveStale(existing)) {
         return; // Fresh reserve exists
       }
       // Stale reserve - clean it up and create fresh one
-      this.reserves.delete(projectId);
+      this.reserves.delete(reserveKey);
       this.cleanupReserve(existing).catch(() => {});
     }
 
     // Start background creation
-    this.creationInProgress.add(projectId);
+    this.creationInProgress.add(reserveKey);
 
     try {
-      await this.createReserve(projectId, projectPath, baseRef);
+      await this.createReserve(projectId, projectPath, this.normalizeBaseRef(baseRef));
     } catch (error) {
-      log.warn('WorktreePool: Failed to create reserve', { projectId, error });
+      log.warn('WorktreePool: Failed to create reserve', { projectId, baseRef, error });
     } finally {
-      this.creationInProgress.delete(projectId);
+      this.creationInProgress.delete(reserveKey);
     }
   }
 
@@ -138,7 +206,7 @@ export class WorktreePoolService {
   private async createReserve(
     projectId: string,
     projectPath: string,
-    baseRef?: string
+    baseRef: string
   ): Promise<void> {
     const hash = this.generateReserveHash();
     const reservePath = this.getReservePath(projectPath, hash);
@@ -150,14 +218,19 @@ export class WorktreePoolService {
       fs.mkdirSync(worktreesDir, { recursive: true });
     }
 
-    // Resolve base ref (default to HEAD if not specified)
-    const useBaseRef = baseRef || 'HEAD';
+    // Keep reserve refs fresh in the background so claim remains instant.
+    await this.refreshRefsForReserveCreation(projectPath, projectId);
 
-    // Note: We skip git fetch for reserve creation to avoid SSH prompts blocking
-    // The worktree will use local refs which is fine for pre-warming purposes
+    // Resolve HEAD/local refs to remote tracking refs (freshly fetched)
+    // so the worktree is created from up-to-date code, not a stale local branch.
+    const resolvedRef = await this.resolveToRemoteRef(projectPath, baseRef);
 
-    // Create the worktree
-    await this.execGit(['worktree', 'add', '-b', reserveBranch, reservePath, useBaseRef], projectPath);
+    // Create the worktree with --no-track to prevent auto-tracking base ref
+    // Tracking is set explicitly via push --set-upstream when the reserve is claimed
+    await this.execGit(
+      ['worktree', 'add', '--no-track', '-b', reserveBranch, reservePath, resolvedRef],
+      projectPath
+    );
 
     const reserveId = this.stableIdFromPath(reservePath);
     const reserve: ReserveWorktree = {
@@ -166,11 +239,11 @@ export class WorktreePoolService {
       branch: reserveBranch,
       projectId,
       projectPath,
-      baseRef: useBaseRef,
+      baseRef,
       createdAt: new Date().toISOString(),
     };
 
-    this.reserves.set(projectId, reserve);
+    this.reserves.set(this.getReserveKey(projectId, baseRef), reserve);
   }
 
   /**
@@ -183,67 +256,32 @@ export class WorktreePoolService {
     taskName: string,
     requestedBaseRef?: string
   ): Promise<ClaimResult | null> {
-    const reserve = this.reserves.get(projectId);
+    const resolvedBaseRef = this.normalizeBaseRef(requestedBaseRef);
+    const reserveKey = this.getReserveKey(projectId, resolvedBaseRef);
+    const reserve = this.reserves.get(reserveKey);
     if (!reserve) {
+      this.replenishReserve(projectId, projectPath, resolvedBaseRef);
       return null;
     }
 
     // Check if reserve is stale (too old)
     if (this.isReserveStale(reserve)) {
       // Remove stale reserve and clean it up in background
-      this.reserves.delete(projectId);
+      this.reserves.delete(reserveKey);
       this.cleanupReserve(reserve).catch(() => {});
       // Start creating a fresh reserve for next time
-      this.replenishReserve(projectId, projectPath, requestedBaseRef);
+      this.replenishReserve(projectId, projectPath, resolvedBaseRef);
       return null; // Caller will use fallback (sync creation)
     }
 
     // Remove from pool immediately to prevent double-claims
-    this.reserves.delete(projectId);
+    this.reserves.delete(reserveKey);
 
     try {
-      // Fetch latest remote refs so the worktree starts from up-to-date code.
-      // This runs in the foreground (user-initiated claim) so a brief delay is acceptable.
-      // Timeout prevents hanging on SSH passphrase prompts.
-      let fetchedRef: string | undefined;
-      try {
-        const fetchPromise = worktreeService.fetchLatestBaseRef(projectPath, projectId);
-        let timeoutId: NodeJS.Timeout;
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timeoutId = setTimeout(() => reject(new Error('Fetch timed out')), 15000);
-        });
-        try {
-          const baseRefInfo = await Promise.race([fetchPromise, timeoutPromise]);
-          fetchedRef = baseRefInfo.fullRef;
-        } finally {
-          clearTimeout(timeoutId!);
-        }
-      } catch (error) {
-        log.warn('WorktreePool: Failed to fetch latest refs, proceeding with local refs', {
-          projectId,
-          error,
-        });
-      }
-
-      const result = await this.transformReserve(reserve, taskName, requestedBaseRef);
-
-      // After a successful fetch, always reset to the latest ref.
-      // We do this independently of transformReserve because its internal reset
-      // compares ref names — if the name matches (e.g. both "origin/main") it
-      // skips the reset even though the ref now points to a newer commit.
-      if (
-        fetchedRef &&
-        (!requestedBaseRef || requestedBaseRef === reserve.baseRef || requestedBaseRef === 'HEAD')
-      ) {
-        try {
-          await this.execGit(['reset', '--hard', fetchedRef], result.worktree.path);
-        } catch (error) {
-          log.warn('WorktreePool: Failed to reset to fetched ref', { error });
-        }
-      }
+      const result = await this.transformReserve(reserve, taskName);
 
       // Start background replenishment
-      this.replenishReserve(projectId, projectPath, requestedBaseRef);
+      this.replenishReserve(projectId, projectPath, resolvedBaseRef);
 
       return result;
     } catch (error) {
@@ -257,11 +295,7 @@ export class WorktreePoolService {
   /**
    * Transform a reserve worktree into a task worktree
    */
-  private async transformReserve(
-    reserve: ReserveWorktree,
-    taskName: string,
-    requestedBaseRef?: string
-  ): Promise<ClaimResult> {
+  private async transformReserve(reserve: ReserveWorktree, taskName: string): Promise<ClaimResult> {
     const { getAppSettings } = await import('../settings');
     const settings = getAppSettings();
     const prefix = settings?.repository?.branchPrefix || 'emdash';
@@ -281,20 +315,6 @@ export class WorktreePoolService {
 
     // Rename the branch (instant operation)
     await this.execGit(['branch', '-m', reserve.branch, newBranch], newPath);
-
-    // Check if we need to switch base refs
-    let needsBaseRefSwitch = false;
-    if (requestedBaseRef && requestedBaseRef !== reserve.baseRef && requestedBaseRef !== 'HEAD') {
-      needsBaseRefSwitch = true;
-      // Do the base ref switch (this might take a moment but is still faster than full creation)
-      try {
-        await this.execGit(['reset', '--hard', requestedBaseRef], newPath);
-        needsBaseRefSwitch = false; // Successfully switched
-      } catch (error) {
-        log.warn('WorktreePool: Failed to switch base ref', { error });
-        // Continue anyway - user can handle this
-      }
-    }
 
     // Preserve project-specific gitignored files from project to worktree
     try {
@@ -319,7 +339,7 @@ export class WorktreePoolService {
     // Register with worktreeService
     worktreeService.registerWorktree(worktree);
 
-    return { worktree, needsBaseRefSwitch };
+    return { worktree, needsBaseRefSwitch: false };
   }
 
   /** Replenish reserve in background after claiming */
@@ -360,6 +380,11 @@ export class WorktreePoolService {
   private async cleanupReserve(reserve: ReserveWorktree): Promise<void> {
     try {
       await this.execGit(['worktree', 'remove', '--force', reserve.path], reserve.projectPath);
+    } catch {
+      // Worktree might already be gone; continue and try branch cleanup.
+    }
+
+    try {
       // Also delete the branch
       await this.execGit(['branch', '-D', reserve.branch], reserve.projectPath);
     } catch {
@@ -368,12 +393,154 @@ export class WorktreePoolService {
   }
 
   /** Remove reserve for a project (e.g., when project is removed) */
-  async removeReserve(projectId: string): Promise<void> {
-    const reserve = this.reserves.get(projectId);
-    if (!reserve) return;
+  async removeReserve(projectId: string, projectPath?: string): Promise<void> {
+    const reservesForProject = Array.from(this.reserves.entries()).filter(([key]) =>
+      key.startsWith(`${projectId}::`)
+    );
+    const resolvedProjectPath = projectPath || reservesForProject[0]?.[1].projectPath;
 
-    this.reserves.delete(projectId);
-    await this.cleanupReserve(reserve);
+    await Promise.all(
+      reservesForProject.map(async ([key, reserve]) => {
+        this.reserves.delete(key);
+        await this.cleanupReserve(reserve);
+      })
+    );
+
+    if (!resolvedProjectPath) {
+      return;
+    }
+
+    await this.cleanupReserveArtifactsForProject(resolvedProjectPath);
+  }
+
+  private async cleanupReserveArtifactsForProject(projectPath: string): Promise<void> {
+    const normalizedProjectPath = path.resolve(projectPath);
+    const reserveBranches = await this.listReserveBranches(normalizedProjectPath);
+    const remainingBranches = new Set(reserveBranches);
+
+    for (const reserve of this.findReserveDirectoriesForProject(
+      normalizedProjectPath,
+      remainingBranches
+    )) {
+      try {
+        await this.execGit(['worktree', 'remove', '--force', reserve.path], normalizedProjectPath);
+      } catch {
+        // Best effort: if git cleanup fails, remove directory directly.
+        try {
+          fs.rmSync(reserve.path, { recursive: true, force: true });
+        } catch {
+          // Ignore secondary cleanup failure.
+        }
+      }
+
+      if (reserve.branch) {
+        await this.deleteBranch(normalizedProjectPath, reserve.branch);
+        remainingBranches.delete(reserve.branch);
+      }
+    }
+
+    // Clean up any remaining reserve branches even if the worktree directory is already gone.
+    for (const branch of remainingBranches) {
+      await this.deleteBranch(normalizedProjectPath, branch);
+    }
+  }
+
+  private findReserveDirectoriesForProject(
+    projectPath: string,
+    reserveBranches: Set<string>
+  ): Array<{ path: string; branch: string | null }> {
+    const worktreesDir = path.join(projectPath, '..', 'worktrees');
+    if (!fs.existsSync(worktreesDir)) {
+      return [];
+    }
+
+    const result: Array<{ path: string; branch: string | null }> = [];
+    try {
+      const entries = fs.readdirSync(worktreesDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !entry.name.startsWith(`${this.RESERVE_PREFIX}-`)) {
+          continue;
+        }
+
+        const reservePath = path.join(worktreesDir, entry.name);
+        const ownerPath = this.getMainRepoPathFromWorktree(reservePath);
+        const branch = this.getReserveBranchFromDirectoryName(entry.name);
+        const ownsReserve = ownerPath ? path.resolve(ownerPath) === projectPath : false;
+        const branchBelongsToProject = branch ? reserveBranches.has(branch) : false;
+
+        if (!ownsReserve && !branchBelongsToProject) {
+          continue;
+        }
+
+        result.push({ path: reservePath, branch });
+      }
+    } catch {
+      // Ignore unreadable worktrees directory.
+    }
+
+    return result;
+  }
+
+  private getReserveBranchFromDirectoryName(name: string): string | null {
+    const branchMatch = name.match(/^_reserve-(.+)$/);
+    if (!branchMatch) return null;
+    return `_reserve/${branchMatch[1]}`;
+  }
+
+  private async listReserveBranches(projectPath: string): Promise<string[]> {
+    try {
+      const { stdout } = await this.execGit(
+        ['for-each-ref', '--format=%(refname:short)', `refs/heads/${this.RESERVE_PREFIX}`],
+        projectPath
+      );
+      return stdout
+        .trim()
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith(`${this.RESERVE_PREFIX}/`));
+    } catch {
+      return [];
+    }
+  }
+
+  private async deleteBranch(projectPath: string, branchName: string): Promise<void> {
+    try {
+      await this.execGit(['branch', '-D', branchName], projectPath);
+    } catch {
+      // Branch may not exist or still be attached to a worktree.
+    }
+  }
+
+  private getMainRepoPathFromWorktree(worktreePath: string): string | null {
+    const gitDirPath = path.join(worktreePath, '.git');
+    if (!fs.existsSync(gitDirPath)) {
+      return null;
+    }
+
+    try {
+      const gitDirContent = fs.readFileSync(gitDirPath, 'utf8');
+      const match = gitDirContent.match(/gitdir:\s*(.+)/);
+      if (!match) {
+        return null;
+      }
+
+      const gitWorktreePath = match[1].trim();
+      const resolvedGitWorktreePath = path.isAbsolute(gitWorktreePath)
+        ? gitWorktreePath
+        : path.resolve(worktreePath, gitWorktreePath);
+      const mainRepoPath = resolvedGitWorktreePath.replace(
+        /[\\\\/]\.git[\\\\/]worktrees[\\\\/].*$/,
+        ''
+      );
+      if (mainRepoPath !== resolvedGitWorktreePath) {
+        return mainRepoPath;
+      }
+
+      // Fallback for unexpected gitdir layouts.
+      return resolvedGitWorktreePath.replace(/[\\\\/]\.git$/, '');
+    } catch {
+      return null;
+    }
   }
 
   /** Cleanup all reserves (e.g., on app shutdown) */
@@ -393,23 +560,29 @@ export class WorktreePoolService {
    * Called on app startup to handle reserves left behind from crashes or forced quits.
    * Runs in background and doesn't block app startup.
    */
-  async cleanupOrphanedReserves(): Promise<void> {
+  async cleanupOrphanedReserves(projectPaths: string[] = []): Promise<void> {
     // Small delay to not compete with critical startup tasks
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
     // Find all worktree directories that might contain reserves
-    const homedir = require('os').homedir();
+    const os = await import('os');
+    const homedir = os.homedir();
+    const projectWorktreeDirs = projectPaths.map((projectPath) =>
+      path.join(projectPath, '..', 'worktrees')
+    );
     const possibleWorktreeDirs = [
+      ...projectWorktreeDirs,
       path.join(homedir, 'cursor', 'worktrees'),
       path.join(homedir, 'Documents', 'worktrees'),
       path.join(homedir, 'Projects', 'worktrees'),
       path.join(homedir, 'code', 'worktrees'),
       path.join(homedir, 'dev', 'worktrees'),
     ];
+    const uniqueWorktreeDirs = [...new Set(possibleWorktreeDirs.map((dir) => path.resolve(dir)))];
 
     // Collect all orphaned reserves first (fast sync scan)
     const orphanedReserves: { path: string; name: string }[] = [];
-    for (const worktreesDir of possibleWorktreeDirs) {
+    for (const worktreesDir of uniqueWorktreeDirs) {
       if (!fs.existsSync(worktreesDir)) continue;
       try {
         const entries = fs.readdirSync(worktreesDir, { withFileTypes: true });
@@ -440,33 +613,18 @@ export class WorktreePoolService {
   private async cleanupOrphanedReserve(reservePath: string, name: string): Promise<boolean> {
     try {
       // Try to find the parent git repo to properly remove the worktree
-      const gitDirPath = path.join(reservePath, '.git');
-      if (fs.existsSync(gitDirPath)) {
-        const gitDirContent = fs.readFileSync(gitDirPath, 'utf8');
-        const match = gitDirContent.match(/gitdir:\s*(.+)/);
-        if (match) {
-          // Extract the main repo path from the gitdir reference
-          const gitWorktreePath = match[1].trim();
-          const mainGitDir = gitWorktreePath.replace(/\/\.git\/worktrees\/.*$/, '');
+      const mainRepoPath = this.getMainRepoPathFromWorktree(reservePath);
+      if (mainRepoPath && fs.existsSync(mainRepoPath)) {
+        // Remove worktree via git
+        await this.execGit(['worktree', 'remove', '--force', reservePath], mainRepoPath);
 
-          if (fs.existsSync(mainGitDir)) {
-            // Remove worktree via git
-            await this.execGit(['worktree', 'remove', '--force', reservePath], mainGitDir);
-
-            // Try to remove the reserve branch
-            const branchMatch = name.match(/^_reserve-(.+)$/);
-            if (branchMatch) {
-              const branchName = `_reserve/${branchMatch[1]}`;
-              try {
-                await this.execGit(['branch', '-D', branchName], mainGitDir);
-              } catch {
-                // Branch may not exist
-              }
-            }
-
-            return true;
-          }
+        // Try to remove the reserve branch
+        const branchName = this.getReserveBranchFromDirectoryName(name);
+        if (branchName) {
+          await this.deleteBranch(mainRepoPath, branchName);
         }
+
+        return true;
       }
 
       // Fallback: just remove the directory

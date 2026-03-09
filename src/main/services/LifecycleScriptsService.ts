@@ -13,6 +13,8 @@ export interface EmdashConfig {
   preservePatterns?: string[];
   scripts?: LifecycleScriptConfig;
   quickActions?: QuickAction[];
+  shellSetup?: string;
+  tmux?: boolean;
 }
 
 /**
@@ -45,6 +47,28 @@ class LifecycleScriptsService {
     const scripts = config?.scripts;
     const script = scripts?.[phase];
     return typeof script === 'string' && script.trim().length > 0 ? script.trim() : null;
+  }
+
+  /**
+   * Get the shell setup command if configured in .emdash.json.
+   * Runs inside every PTY (agent and plain terminal) before the shell starts.
+   */
+  getShellSetup(projectPath: string): string | null {
+    const config = this.readConfig(projectPath);
+    const shellSetup = config?.shellSetup;
+    return typeof shellSetup === 'string' && shellSetup.trim().length > 0
+      ? shellSetup.trim()
+      : null;
+  }
+
+  /**
+   * Check if tmux wrapping is enabled for this project in .emdash.json.
+   * When true, agent PTY sessions are wrapped in named tmux sessions
+   * for persistence and resumability.
+   */
+  getTmuxEnabled(projectPath: string): boolean {
+    const config = this.readConfig(projectPath);
+    return config?.tmux === true;
   }
 }
 

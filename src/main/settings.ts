@@ -1,10 +1,16 @@
 import { app } from 'electron';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname, join } from 'path';
-import { homedir } from 'os';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import type { ProviderId } from '@shared/providers/registry';
 import { isValidProviderId } from '@shared/providers/registry';
 import { isValidOpenInAppId, type OpenInAppId } from '@shared/openInApps';
+
+export type DeepPartial<T> = {
+  [K in keyof T]?: NonNullable<T[K]> extends object ? DeepPartial<NonNullable<T[K]>> : T[K];
+};
+
+export type AppSettingsUpdate = DeepPartial<AppSettings>;
 
 const DEFAULT_PROVIDER_ID: ProviderId = 'claude';
 const IS_MAC = process.platform === 'darwin';
@@ -47,6 +53,7 @@ export interface KeyboardSettings {
 export interface InterfaceSettings {
   autoRightSidebarBehavior?: boolean;
   theme?: 'light' | 'dark' | 'dark-black' | 'system';
+  taskHoverAction?: 'delete' | 'archive';
 }
 
 /**
@@ -60,6 +67,8 @@ export interface ProviderCustomConfig {
   defaultArgs?: string;
   autoApproveFlag?: string;
   initialPromptFlag?: string;
+  extraArgs?: string;
+  env?: Record<string, string>;
 }
 
 export type ProviderCustomConfigs = Record<string, ProviderCustomConfig>;
@@ -76,17 +85,15 @@ export interface AppSettings {
   notifications?: {
     enabled: boolean;
     sound: boolean;
-  };
-  mcp?: {
-    context7?: {
-      enabled: boolean;
-      installHintsDismissed?: Record<string, boolean>;
-    };
+    osNotifications: boolean;
+    soundFocusMode: 'always' | 'unfocused';
   };
   defaultProvider?: ProviderId;
   tasks?: {
     autoGenerateName: boolean;
     autoApproveByDefault: boolean;
+    createWorktreeByDefault: boolean;
+    autoTrustWorktrees: boolean;
   };
   projects?: {
     defaultDirectory: string;
@@ -96,8 +103,10 @@ export interface AppSettings {
   providerConfigs?: ProviderCustomConfigs;
   terminal?: {
     fontFamily: string;
+    autoCopyOnSelection: boolean;
   };
   defaultOpenInApp?: OpenInAppId;
+  hiddenOpenInApps?: OpenInAppId[];
 }
 
 function getPlatformTaskSwitchDefaults(): { next: ShortcutBinding; prev: ShortcutBinding } {
@@ -131,17 +140,15 @@ const DEFAULT_SETTINGS: AppSettings = {
   notifications: {
     enabled: true,
     sound: true,
-  },
-  mcp: {
-    context7: {
-      enabled: false,
-      installHintsDismissed: {},
-    },
+    osNotifications: true,
+    soundFocusMode: 'always',
   },
   defaultProvider: DEFAULT_PROVIDER_ID,
   tasks: {
     autoGenerateName: true,
     autoApproveByDefault: false,
+    createWorktreeByDefault: true,
+    autoTrustWorktrees: true,
   },
   projects: {
     defaultDirectory: join(homedir(), 'emdash-projects'),
@@ -157,18 +164,21 @@ const DEFAULT_SETTINGS: AppSettings = {
     nextProject: TASK_SWITCH_DEFAULTS.next,
     prevProject: TASK_SWITCH_DEFAULTS.prev,
     newTask: { key: 'n', modifier: 'cmd' },
-    nextAgent: { key: 'k', modifier: 'cmd+shift' },
-    prevAgent: { key: 'j', modifier: 'cmd+shift' },
+    nextAgent: { key: ']', modifier: 'cmd+shift' },
+    prevAgent: { key: '[', modifier: 'cmd+shift' },
   },
   interface: {
     autoRightSidebarBehavior: false,
     theme: 'system',
+    taskHoverAction: 'delete',
   },
   providerConfigs: {},
   terminal: {
     fontFamily: '',
+    autoCopyOnSelection: false,
   },
   defaultOpenInApp: 'terminal',
+  hiddenOpenInApps: [],
 };
 
 function getSettingsPath(): string {
@@ -290,9 +300,9 @@ export function getAppSettings(): AppSettings {
 /**
  * Update settings and persist to disk. Partial updates are deeply merged.
  */
-export function updateAppSettings(partial: Partial<AppSettings>): AppSettings {
+export function updateAppSettings(partial: AppSettingsUpdate): AppSettings {
   const current = getAppSettings();
-  const merged = deepMerge(current, partial);
+  const merged = deepMerge(current, partial as Partial<AppSettings>);
   const next = normalizeSettings(merged);
   if (partial.keyboard) {
     assertNoKeyboardShortcutConflicts(next.keyboard);
@@ -314,7 +324,7 @@ export function persistSettings(settings: AppSettings) {
 /**
  * Coerce and validate settings for robustness and forward-compatibility.
  */
-function normalizeSettings(input: AppSettings): AppSettings {
+export function normalizeSettings(input: AppSettings): AppSettings {
   const out: AppSettings = {
     repository: {
       branchPrefix: DEFAULT_SETTINGS.repository.branchPrefix,
@@ -330,12 +340,8 @@ function normalizeSettings(input: AppSettings): AppSettings {
     notifications: {
       enabled: DEFAULT_SETTINGS.notifications!.enabled,
       sound: DEFAULT_SETTINGS.notifications!.sound,
-    },
-    mcp: {
-      context7: {
-        enabled: DEFAULT_SETTINGS.mcp!.context7!.enabled,
-        installHintsDismissed: {},
-      },
+      osNotifications: DEFAULT_SETTINGS.notifications!.osNotifications,
+      soundFocusMode: DEFAULT_SETTINGS.notifications!.soundFocusMode,
     },
   };
 
@@ -362,22 +368,17 @@ function normalizeSettings(input: AppSettings): AppSettings {
   };
 
   const notif = (input as any)?.notifications || {};
+  const rawFocusMode = notif?.soundFocusMode;
   out.notifications = {
     enabled: Boolean(notif?.enabled ?? DEFAULT_SETTINGS.notifications!.enabled),
     sound: Boolean(notif?.sound ?? DEFAULT_SETTINGS.notifications!.sound),
-  };
-
-  // MCP
-  const mcp = (input as any)?.mcp || {};
-  const c7 = mcp?.context7 || {};
-  out.mcp = {
-    context7: {
-      enabled: Boolean(c7?.enabled ?? DEFAULT_SETTINGS.mcp!.context7!.enabled),
-      installHintsDismissed:
-        c7?.installHintsDismissed && typeof c7.installHintsDismissed === 'object'
-          ? { ...c7.installHintsDismissed }
-          : {},
-    },
+    osNotifications: Boolean(
+      notif?.osNotifications ?? DEFAULT_SETTINGS.notifications!.osNotifications
+    ),
+    soundFocusMode:
+      rawFocusMode === 'always' || rawFocusMode === 'unfocused'
+        ? rawFocusMode
+        : DEFAULT_SETTINGS.notifications!.soundFocusMode,
   };
 
   // Default provider
@@ -392,6 +393,12 @@ function normalizeSettings(input: AppSettings): AppSettings {
     autoGenerateName: Boolean(tasks?.autoGenerateName ?? DEFAULT_SETTINGS.tasks!.autoGenerateName),
     autoApproveByDefault: Boolean(
       tasks?.autoApproveByDefault ?? DEFAULT_SETTINGS.tasks!.autoApproveByDefault
+    ),
+    createWorktreeByDefault: Boolean(
+      tasks?.createWorktreeByDefault ?? DEFAULT_SETTINGS.tasks!.createWorktreeByDefault
+    ),
+    autoTrustWorktrees: Boolean(
+      tasks?.autoTrustWorktrees ?? DEFAULT_SETTINGS.tasks!.autoTrustWorktrees
     ),
   };
 
@@ -463,6 +470,7 @@ function normalizeSettings(input: AppSettings): AppSettings {
     theme: ['light', 'dark', 'dark-black', 'system'].includes(iface?.theme)
       ? iface.theme
       : DEFAULT_SETTINGS.interface!.theme,
+    taskHoverAction: iface?.taskHoverAction === 'archive' ? 'archive' : 'delete',
   };
 
   // Provider custom configs
@@ -472,6 +480,20 @@ function normalizeSettings(input: AppSettings): AppSettings {
     for (const [providerId, config] of Object.entries(providerConfigs)) {
       if (config && typeof config === 'object') {
         const c = config as Record<string, unknown>;
+        let env: Record<string, string> | undefined;
+        if (c.env && typeof c.env === 'object') {
+          env = {};
+          for (const [k, v] of Object.entries(c.env)) {
+            if (
+              typeof k === 'string' &&
+              typeof v === 'string' &&
+              /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)
+            ) {
+              env[k] = v;
+            }
+          }
+          if (Object.keys(env).length === 0) env = undefined;
+        }
         out.providerConfigs[providerId] = {
           ...(typeof c.cli === 'string' ? { cli: c.cli } : {}),
           ...(typeof c.resumeFlag === 'string' ? { resumeFlag: c.resumeFlag } : {}),
@@ -480,6 +502,8 @@ function normalizeSettings(input: AppSettings): AppSettings {
           ...(typeof c.initialPromptFlag === 'string'
             ? { initialPromptFlag: c.initialPromptFlag }
             : {}),
+          ...(typeof c.extraArgs === 'string' ? { extraArgs: c.extraArgs } : {}),
+          ...(env ? { env } : {}),
         };
       }
     }
@@ -488,13 +512,23 @@ function normalizeSettings(input: AppSettings): AppSettings {
   // Terminal
   const term = (input as any)?.terminal || {};
   const fontFamily = String(term?.fontFamily ?? '').trim();
-  out.terminal = { fontFamily };
+  const autoCopyOnSelection = Boolean(term?.autoCopyOnSelection ?? false);
+  out.terminal = { fontFamily, autoCopyOnSelection };
 
   // Default Open In App
   const defaultOpenInApp = (input as any)?.defaultOpenInApp;
   out.defaultOpenInApp = isValidOpenInAppId(defaultOpenInApp)
     ? defaultOpenInApp
     : DEFAULT_SETTINGS.defaultOpenInApp!;
+
+  // Hidden Open In Apps
+  const rawHidden = (input as any)?.hiddenOpenInApps;
+  if (Array.isArray(rawHidden)) {
+    const validated = rawHidden.filter(isValidOpenInAppId);
+    out.hiddenOpenInApps = [...new Set(validated)];
+  } else {
+    out.hiddenOpenInApps = [];
+  }
 
   return out;
 }

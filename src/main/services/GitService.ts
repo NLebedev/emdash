@@ -2,18 +2,24 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execGit as execGitCommand, DEFAULT_GIT_MAX_BUFFER_BYTES } from '../utils/gitExec';
+import {
+  parseDiffLines,
+  stripTrailingNewline,
+  MAX_DIFF_CONTENT_BYTES,
+  MAX_DIFF_OUTPUT_BYTES,
+} from '../utils/diffParser';
+import type { DiffLine, DiffResult } from '../utils/diffParser';
 
 const MAX_UNTRACKED_LINECOUNT_BYTES = 512 * 1024;
-const MAX_UNTRACKED_DIFF_BYTES = 512 * 1024;
 
 async function execGit(
   taskPath: string,
   args: string[],
-  options?: { timeout?: number }
+  options?: { timeout?: number; maxBuffer?: number }
 ): Promise<{ stdout: string; stderr: string }> {
   return execGitCommand(args, taskPath, {
     timeout: options?.timeout,
-    maxBuffer: DEFAULT_GIT_MAX_BUFFER_BYTES,
+    maxBuffer: options?.maxBuffer ?? DEFAULT_GIT_MAX_BUFFER_BYTES,
   });
 }
 
@@ -146,11 +152,18 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
 
   if (!statusOutput.trim()) return [];
 
-  const changes: GitChange[] = [];
   const statusLines = statusOutput
     .split('\n')
     .map((l) => l.replace(/\r$/, ''))
     .filter((l) => l.length > 0);
+
+  // Parse status lines into file entries
+  const entries: Array<{
+    filePath: string;
+    status: string;
+    statusCode: string;
+    isStaged: boolean;
+  }> = [];
 
   for (const line of statusLines) {
     const statusCode = line.substring(0, 2);
@@ -166,81 +179,95 @@ export async function getStatus(taskPath: string): Promise<GitChange[]> {
     else if (statusCode.includes('R')) status = 'renamed';
     else if (statusCode.includes('M')) status = 'modified';
 
-    const indexStatus = statusCode[0] ?? ' ';
-    const worktreeStatus = statusCode[1] ?? ' ';
+    const isStaged = statusCode[0] !== ' ' && statusCode[0] !== '?';
+    entries.push({ filePath, status, statusCode, isStaged });
+  }
 
-    // First character is index (staged), second is working tree (unstaged)
-    const isStaged = indexStatus !== ' ' && indexStatus !== '?';
-    const hasUnstaged = worktreeStatus !== ' ';
-    let stagedAdditions = 0;
-    let stagedDeletions = 0;
-    let unstagedAdditions = 0;
-    let unstagedDeletions = 0;
+  // Batch: run ONE staged numstat and ONE unstaged numstat for ALL files at once
+  const resolveRenamePath = (file: string): string => {
+    if (!file.includes(' => ')) return file;
+    if (file.includes('{')) {
+      return file.replace(/\{[^}]+ => ([^}]+)\}/g, '$1').replace(/\/\//g, '/');
+    }
+    return file.split(' => ').pop()!.trim();
+  };
 
-    const parseNumstat = (stdout: string) => {
-      let additions = 0;
-      let deletions = 0;
-      const lines = stdout
-        .trim()
-        .split('\n')
-        .filter((l) => l.trim().length > 0);
-      for (const l of lines) {
-        const p = l.split('\t');
-        if (p.length >= 2) {
-          const addStr = p[0];
-          const delStr = p[1];
-          const a = addStr === '-' ? 0 : parseInt(addStr, 10) || 0;
-          const d = delStr === '-' ? 0 : parseInt(delStr, 10) || 0;
-          additions += a;
-          deletions += d;
+  const parseNumstatMap = (stdout: string): Map<string, { add: number; del: number }> => {
+    const map = new Map<string, { add: number; del: number }>();
+    if (!stdout || !stdout.trim()) return map;
+    for (const line of stdout.trim().split('\n')) {
+      if (!line.trim()) continue;
+      const parts = line.split('\t');
+      if (parts.length >= 3) {
+        const add = parts[0] === '-' ? 0 : Number.parseInt(parts[0], 10) || 0;
+        const del = parts[1] === '-' ? 0 : Number.parseInt(parts[1], 10) || 0;
+        const file = resolveRenamePath(parts.slice(2).join('\t'));
+        const existing = map.get(file);
+        if (existing) {
+          existing.add += add;
+          existing.del += del;
+        } else {
+          map.set(file, { add, del });
         }
       }
-      return { additions, deletions };
-    };
-
-    try {
-      const staged = await execGit(taskPath, ['diff', '--numstat', '--cached', '--', filePath]);
-      if (staged.stdout && staged.stdout.trim()) {
-        const parsed = parseNumstat(staged.stdout);
-        stagedAdditions = parsed.additions;
-        stagedDeletions = parsed.deletions;
-      }
-    } catch {}
-
-    try {
-      const unstaged = await execGit(taskPath, ['diff', '--numstat', '--', filePath]);
-      if (unstaged.stdout && unstaged.stdout.trim()) {
-        const parsed = parseNumstat(unstaged.stdout);
-        unstagedAdditions = parsed.additions;
-        unstagedDeletions = parsed.deletions;
-      }
-    } catch {}
-
-    let additions = stagedAdditions + unstagedAdditions;
-    const deletions = stagedDeletions + unstagedDeletions;
-
-    if (additions === 0 && deletions === 0 && statusCode.includes('?')) {
-      const absPath = path.join(taskPath, filePath);
-      const count = await countFileNewlinesCapped(absPath, MAX_UNTRACKED_LINECOUNT_BYTES);
-      if (typeof count === 'number') {
-        additions = count;
-        unstagedAdditions = count;
-      }
     }
+    return map;
+  };
 
-    changes.push({
-      path: filePath,
-      status,
-      additions,
-      deletions,
-      isStaged,
-      hasUnstaged,
+  const [stagedResult, unstagedResult] = await Promise.all([
+    execGit(taskPath, ['diff', '--numstat', '--cached']).catch(() => ({
+      stdout: '',
+      stderr: '',
+    })),
+    execGit(taskPath, ['diff', '--numstat']).catch(() => ({
+      stdout: '',
+      stderr: '',
+    })),
+  ]);
+
+  const stagedMap = parseNumstatMap(stagedResult.stdout);
+  const unstagedMap = parseNumstatMap(unstagedResult.stdout);
+
+  // Count lines for untracked files in parallel
+  const untrackedEntries = entries.filter(
+    (e) => e.statusCode.includes('?') && !stagedMap.has(e.filePath) && !unstagedMap.has(e.filePath)
+  );
+  const untrackedCounts = await Promise.all(
+    untrackedEntries.map((e) =>
+      countFileNewlinesCapped(path.join(taskPath, e.filePath), MAX_UNTRACKED_LINECOUNT_BYTES)
+    )
+  );
+  const untrackedMap = new Map<string, number>();
+  untrackedEntries.forEach((e, i) => {
+    if (typeof untrackedCounts[i] === 'number') {
+      untrackedMap.set(e.filePath, untrackedCounts[i]!);
+    }
+  });
+
+  // Assemble results
+  const changes: GitChange[] = entries.map((e) => {
+    const staged = stagedMap.get(e.filePath);
+    const unstaged = unstagedMap.get(e.filePath);
+
+    const stagedAdditions = staged?.add ?? 0;
+    const stagedDeletions = staged?.del ?? 0;
+    const unstagedAdditions =
+      unstaged?.add ?? (e.statusCode.includes('?') ? (untrackedMap.get(e.filePath) ?? 0) : 0);
+    const unstagedDeletions = unstaged?.del ?? 0;
+
+    return {
+      path: e.filePath,
+      status: e.status,
+      additions: stagedAdditions + unstagedAdditions,
+      deletions: stagedDeletions + unstagedDeletions,
+      isStaged: e.isStaged,
+      hasUnstaged: e.statusCode[1] !== ' ',
       stagedAdditions,
       stagedDeletions,
       unstagedAdditions,
       unstagedDeletions,
-    });
-  }
+    };
+  });
 
   return changes;
 }
@@ -346,18 +373,37 @@ export async function unstageDiffRange(
   startLine: number,
   endLine: number
 ): Promise<{ unstaged: boolean; unstagedHunks: number }> {
-  const result = await applyDiffRangeToIndex(taskPath, filePath, startLine, endLine, 'staged', true);
+  const result = await applyDiffRangeToIndex(
+    taskPath,
+    filePath,
+    startLine,
+    endLine,
+    'staged',
+    true
+  );
   return { unstaged: result.applied, unstagedHunks: result.hunks };
 }
 
 export async function unstageFile(taskPath: string, filePath: string): Promise<void> {
-  await execGit(taskPath, ['reset', 'HEAD', '--', filePath]);
+  try {
+    await execGit(taskPath, ['reset', 'HEAD', '--', filePath]);
+  } catch {
+    // HEAD may not exist (no commits yet) - use rm --cached instead
+    await execGit(taskPath, ['rm', '--cached', '--', filePath]);
+  }
 }
 
 export async function revertFile(
   taskPath: string,
   filePath: string
 ): Promise<{ action: 'unstaged' | 'reverted' }> {
+  // Validate filePath doesn't escape the worktree
+  const absPath = path.resolve(taskPath, filePath);
+  const resolvedTaskPath = path.resolve(taskPath);
+  if (!absPath.startsWith(resolvedTaskPath + path.sep) && absPath !== resolvedTaskPath) {
+    throw new Error('File path is outside the worktree');
+  }
+
   // Check if file is staged
   try {
     const { stdout: stagedStatus } = await execGit(taskPath, [
@@ -370,7 +416,7 @@ export async function revertFile(
 
     if (stagedStatus.trim()) {
       // File is staged, unstage it (but keep working directory changes)
-      await execGit(taskPath, ['reset', 'HEAD', '--', filePath]);
+      await unstageFile(taskPath, filePath);
       return { action: 'unstaged' };
     }
   } catch {}
@@ -382,7 +428,6 @@ export async function revertFile(
     fileExistsInHead = true;
   } catch {
     // File doesn't exist in HEAD (it's a new/untracked file), delete it
-    const absPath = path.join(taskPath, filePath);
     if (fs.existsSync(absPath)) {
       fs.unlinkSync(absPath);
     }
@@ -394,7 +439,6 @@ export async function revertFile(
     try {
       await execGit(taskPath, ['checkout', 'HEAD', '--', filePath]);
     } catch (error) {
-      // If checkout fails, don't delete the file - throw the error instead
       throw new Error(
         `Failed to revert file: ${error instanceof Error ? error.message : String(error)}`
       );
@@ -405,111 +449,436 @@ export async function revertFile(
 
 export type GitDiffScope = 'all' | 'staged' | 'unstaged';
 
-type GitDiffLine = { left?: string; right?: string; type: 'context' | 'add' | 'del' };
-
-function parseDiffOutput(stdout: string): GitDiffLine[] {
-  const linesRaw = stdout.split('\n');
-  const result: GitDiffLine[] = [];
-
-  for (const line of linesRaw) {
-    if (!line) continue;
-    if (
-      line.startsWith('diff ') ||
-      line.startsWith('index ') ||
-      line.startsWith('--- ') ||
-      line.startsWith('+++ ') ||
-      line.startsWith('@@')
-    ) {
-      continue;
-    }
-
-    const prefix = line[0];
-    const content = line.slice(1);
-    if (prefix === ' ') result.push({ left: content, right: content, type: 'context' });
-    else if (prefix === '-') result.push({ left: content, type: 'del' });
-    else if (prefix === '+') result.push({ right: content, type: 'add' });
-    else result.push({ left: line, right: line, type: 'context' });
-  }
-
-  return result;
-}
-
-function toAddedLines(content: string): GitDiffLine[] {
-  return content.split('\n').map((line) => ({ right: line, type: 'add' as const }));
-}
-
-function toDeletedLines(content: string): GitDiffLine[] {
-  return content.split('\n').map((line) => ({ left: line, type: 'del' as const }));
-}
-
-function getDiffArgs(filePath: string, scope: GitDiffScope): string[] {
-  if (scope === 'staged') {
-    return ['diff', '--cached', '--no-color', '--unified=2000', '--', filePath];
-  }
-  if (scope === 'unstaged') {
-    return ['diff', '--no-color', '--unified=2000', '--', filePath];
-  }
-  return ['diff', '--no-color', '--unified=2000', 'HEAD', '--', filePath];
-}
-
 export async function getFileDiff(
   taskPath: string,
   filePath: string,
   scope: GitDiffScope = 'all'
-): Promise<{ lines: GitDiffLine[] }> {
-  try {
-    const { stdout } = await execGit(taskPath, getDiffArgs(filePath, scope));
-    const parsed = parseDiffOutput(stdout);
-    if (parsed.length > 0) {
-      return { lines: parsed };
-    }
-  } catch {
-    // Fall through to scope-specific recovery paths.
+): Promise<DiffResult> {
+  const absPath = path.resolve(taskPath, filePath);
+  const resolvedTaskPath = path.resolve(taskPath);
+  if (!absPath.startsWith(resolvedTaskPath + path.sep) && absPath !== resolvedTaskPath) {
+    throw new Error('File path is outside the worktree');
   }
 
-  if (scope !== 'staged') {
-    const absPath = path.join(taskPath, filePath);
-    const currentContent = await readFileTextCapped(absPath, MAX_UNTRACKED_DIFF_BYTES);
-    if (currentContent !== null) {
-      return { lines: toAddedLines(currentContent) };
-    }
-  }
-
-  if (scope === 'unstaged') {
+  const getContentAt = async (ref: string): Promise<string | undefined> => {
     try {
-      const { stdout: indexContent } = await execGit(taskPath, ['show', `:${filePath}`]);
-      return { lines: toDeletedLines(indexContent) };
+      const { stdout } = await execGit(taskPath, ['show', `${ref}:${filePath}`], {
+        maxBuffer: MAX_DIFF_CONTENT_BYTES,
+      });
+      return stripTrailingNewline(stdout);
     } catch {
-      return { lines: [] };
+      return undefined;
     }
-  }
+  };
+
+  const getDiskContent = async (): Promise<string | undefined> => {
+    const content = await readFileTextCapped(path.join(taskPath, filePath), MAX_DIFF_CONTENT_BYTES);
+    return content !== null ? stripTrailingNewline(content) : undefined;
+  };
+
+  const diffArgs: string[] = ['diff', '--no-color', '--unified=2000'];
+  let originalRef: string | undefined;
+  let modifiedRef: string | undefined;
 
   if (scope === 'staged') {
-    try {
-      const { stdout: indexContent } = await execGit(taskPath, ['show', `:${filePath}`]);
-      try {
-        await execGit(taskPath, ['cat-file', '-e', `HEAD:${filePath}`]);
-        // File exists in HEAD and no parsed diff means there are no staged changes for this file.
-        return { lines: [] };
-      } catch {
-        // File exists in index but not in HEAD -> staged add.
-        return { lines: toAddedLines(indexContent) };
+    diffArgs.push('--cached', '--', filePath);
+    originalRef = 'HEAD';
+    modifiedRef = ''; // index
+  } else if (scope === 'unstaged') {
+    diffArgs.push('--', filePath);
+    originalRef = ''; // index
+    modifiedRef = 'disk';
+  } else {
+    diffArgs.push('HEAD', '--', filePath);
+    originalRef = 'HEAD';
+    modifiedRef = 'disk';
+  }
+
+  let diffStdout: string | undefined;
+  try {
+    const { stdout } = await execGit(taskPath, diffArgs, { maxBuffer: MAX_DIFF_OUTPUT_BYTES });
+    diffStdout = stdout;
+  } catch {
+    // fallback to content-only
+  }
+
+  if (diffStdout !== undefined) {
+    const { lines, isBinary } = parseDiffLines(diffStdout);
+    if (isBinary) return { lines: [], isBinary: true };
+
+    const [originalContent, modifiedContent] = await Promise.all([
+      originalRef === ''
+        ? getContentAt('')
+        : originalRef === 'HEAD'
+          ? getContentAt('HEAD')
+          : Promise.resolve(undefined),
+      modifiedRef === ''
+        ? getContentAt('')
+        : modifiedRef === 'disk'
+          ? getDiskContent()
+          : Promise.resolve(undefined),
+    ]);
+
+    if (lines.length === 0) {
+      if (modifiedContent !== undefined) {
+        return {
+          lines: modifiedContent.split('\n').map((l) => ({ right: l, type: 'add' as const })),
+          modifiedContent,
+        };
       }
+      if (originalContent !== undefined) {
+        return {
+          lines: originalContent.split('\n').map((l) => ({ left: l, type: 'del' as const })),
+          originalContent,
+        };
+      }
+      return { lines: [] };
+    }
+    return { lines, originalContent, modifiedContent };
+  }
+
+  const [originalContent, modifiedContent] = await Promise.all([
+    originalRef === ''
+      ? getContentAt('')
+      : originalRef === 'HEAD'
+        ? getContentAt('HEAD')
+        : Promise.resolve(undefined),
+    modifiedRef === ''
+      ? getContentAt('')
+      : modifiedRef === 'disk'
+        ? getDiskContent()
+        : Promise.resolve(undefined),
+  ]);
+
+  if (modifiedContent !== undefined) {
+    return {
+      lines: modifiedContent.split('\n').map((l) => ({ right: l, type: 'add' as const })),
+      originalContent,
+      modifiedContent,
+    };
+  }
+  if (originalContent !== undefined) {
+    return {
+      lines: originalContent.split('\n').map((l) => ({ left: l, type: 'del' as const })),
+      originalContent,
+    };
+  }
+  return { lines: [] };
+}
+
+/** Commit staged files (no push). Returns the commit hash. */
+export async function commit(taskPath: string, message: string): Promise<{ hash: string }> {
+  if (!message || !message.trim()) {
+    throw new Error('Commit message cannot be empty');
+  }
+  await execGit(taskPath, ['commit', '-m', message]);
+  const { stdout } = await execGit(taskPath, ['rev-parse', 'HEAD']);
+  return { hash: stdout.trim() };
+}
+
+/** Push current branch to origin. Sets upstream if needed. */
+export async function push(taskPath: string): Promise<{ output: string }> {
+  try {
+    const { stdout } = await execGit(taskPath, ['push']);
+    return { output: stdout.trim() };
+  } catch (error: any) {
+    const stderr = error?.stderr || '';
+    if (stderr.includes('has no upstream branch') || stderr.includes('no upstream configured')) {
+      const { stdout: branch } = await execGit(taskPath, ['branch', '--show-current']);
+      const { stdout } = await execGit(taskPath, [
+        'push',
+        '--set-upstream',
+        'origin',
+        branch.trim(),
+      ]);
+      return { output: stdout.trim() };
+    }
+    throw error;
+  }
+}
+
+/** Pull from remote. */
+export async function pull(taskPath: string): Promise<{ output: string }> {
+  const { stdout } = await execGit(taskPath, ['pull']);
+  return { output: stdout.trim() };
+}
+
+/** Get commit log for the current branch. */
+export async function getLog(
+  taskPath: string,
+  maxCount: number = 50,
+  skip: number = 0,
+  knownAheadCount?: number
+): Promise<{
+  commits: Array<{
+    hash: string;
+    subject: string;
+    body: string;
+    author: string;
+    authorEmail: string;
+    date: string;
+    isPushed: boolean;
+    tags: string[];
+  }>;
+  aheadCount: number;
+}> {
+  let aheadCount = knownAheadCount ?? -1;
+  if (aheadCount < 0) {
+    aheadCount = 0;
+    try {
+      const { stdout: countOut } = await execGit(taskPath, [
+        'rev-list',
+        '--count',
+        '@{upstream}..HEAD',
+      ]);
+      aheadCount = Number.parseInt(countOut.trim(), 10) || 0;
     } catch {
       try {
-        // File missing from index but present in HEAD -> staged delete.
-        const { stdout: headContent } = await execGit(taskPath, ['show', `HEAD:${filePath}`]);
-        return { lines: toDeletedLines(headContent) };
+        const { stdout: branchOut } = await execGit(taskPath, [
+          'rev-parse',
+          '--abbrev-ref',
+          'HEAD',
+        ]);
+        const currentBranch = branchOut.trim();
+        const { stdout: countOut } = await execGit(taskPath, [
+          'rev-list',
+          '--count',
+          `origin/${currentBranch}..HEAD`,
+        ]);
+        aheadCount = Number.parseInt(countOut.trim(), 10) || 0;
       } catch {
-        return { lines: [] };
+        try {
+          const { stdout: defaultBranchOut } = await execGit(taskPath, [
+            'symbolic-ref',
+            '--short',
+            'refs/remotes/origin/HEAD',
+          ]);
+          const defaultBranch = defaultBranchOut.trim();
+          const { stdout: countOut } = await execGit(taskPath, [
+            'rev-list',
+            '--count',
+            `${defaultBranch}..HEAD`,
+          ]);
+          aheadCount = Number.parseInt(countOut.trim(), 10) || 0;
+        } catch {
+          aheadCount = 0;
+        }
       }
     }
   }
 
-  try {
-    const { stdout: headContent } = await execGit(taskPath, ['show', `HEAD:${filePath}`]);
-    return { lines: toDeletedLines(headContent) };
-  } catch {
-    return { lines: [] };
+  const FIELD_SEP = '---FIELD_SEP---';
+  const RECORD_SEP = '---RECORD_SEP---';
+  const format = `${RECORD_SEP}%H${FIELD_SEP}%s${FIELD_SEP}%an${FIELD_SEP}%aI${FIELD_SEP}%D${FIELD_SEP}%ae${FIELD_SEP}%b`;
+  const { stdout } = await execGit(taskPath, [
+    'log',
+    `--max-count=${maxCount}`,
+    `--skip=${skip}`,
+    `--pretty=format:${format}`,
+    '--',
+  ]);
+
+  if (!stdout.trim()) return { commits: [], aheadCount };
+
+  const commits = stdout
+    .split(RECORD_SEP)
+    .filter((entry) => entry.trim())
+    .map((entry, index) => {
+      const parts = entry.trim().split(FIELD_SEP);
+      const refs = parts[4] || '';
+      const tags = refs
+        .split(',')
+        .map((r) => r.trim())
+        .filter((r) => r.startsWith('tag: '))
+        .map((r) => r.slice(5));
+      return {
+        hash: parts[0] || '',
+        subject: parts[1] || '',
+        body: (parts[6] || '').trim(),
+        author: parts[2] || '',
+        authorEmail: parts[5] || '',
+        date: parts[3] || '',
+        isPushed: skip + index >= aheadCount,
+        tags,
+      };
+    });
+
+  return { commits, aheadCount };
+}
+
+/** Get the latest commit info (subject + body). */
+export async function getLatestCommit(
+  taskPath: string
+): Promise<{ hash: string; subject: string; body: string; isPushed: boolean } | null> {
+  const { commits } = await getLog(taskPath, 1);
+  return commits[0] || null;
+}
+
+/** Get files changed in a specific commit. */
+export async function getCommitFiles(
+  taskPath: string,
+  commitHash: string
+): Promise<Array<{ path: string; status: string; additions: number; deletions: number }>> {
+  const { stdout } = await execGit(taskPath, [
+    'diff-tree',
+    '--root',
+    '--no-commit-id',
+    '-r',
+    '-m',
+    '--first-parent',
+    '--numstat',
+    commitHash,
+  ]);
+
+  const { stdout: nameStatus } = await execGit(taskPath, [
+    'diff-tree',
+    '--root',
+    '--no-commit-id',
+    '-r',
+    '-m',
+    '--first-parent',
+    '--name-status',
+    commitHash,
+  ]);
+
+  const statLines = stdout.trim().split('\n').filter(Boolean);
+  const statusLines = nameStatus.trim().split('\n').filter(Boolean);
+
+  const statusMap = new Map<string, string>();
+  for (const line of statusLines) {
+    const [code, ...pathParts] = line.split('\t');
+    const filePath = pathParts[pathParts.length - 1] || '';
+    const status =
+      code === 'A'
+        ? 'added'
+        : code === 'D'
+          ? 'deleted'
+          : code?.startsWith('R')
+            ? 'renamed'
+            : 'modified';
+    statusMap.set(filePath, status);
   }
+
+  return statLines.map((line) => {
+    const [addStr, delStr, ...pathParts] = line.split('\t');
+    const filePath = pathParts.join('\t');
+    return {
+      path: filePath,
+      status: statusMap.get(filePath) || 'modified',
+      additions: addStr === '-' ? 0 : Number.parseInt(addStr || '0', 10) || 0,
+      deletions: delStr === '-' ? 0 : Number.parseInt(delStr || '0', 10) || 0,
+    };
+  });
+}
+
+/** Get diff for a specific file in a specific commit. */
+export async function getCommitFileDiff(
+  taskPath: string,
+  commitHash: string,
+  filePath: string
+): Promise<DiffResult> {
+  const absPath = path.resolve(taskPath, filePath);
+  const resolvedTaskPath = path.resolve(taskPath);
+  if (!absPath.startsWith(resolvedTaskPath + path.sep) && absPath !== resolvedTaskPath) {
+    throw new Error('File path is outside the worktree');
+  }
+
+  const getContentAt = async (ref: string): Promise<string | undefined> => {
+    try {
+      const { stdout } = await execGit(taskPath, ['show', `${ref}:${filePath}`], {
+        maxBuffer: MAX_DIFF_CONTENT_BYTES,
+      });
+      return stripTrailingNewline(stdout);
+    } catch {
+      return undefined;
+    }
+  };
+
+  let hasParent = true;
+  try {
+    await execGit(taskPath, ['rev-parse', '--verify', `${commitHash}~1`]);
+  } catch {
+    hasParent = false;
+  }
+
+  if (!hasParent) {
+    const modifiedContent = await getContentAt(commitHash);
+    if (modifiedContent === undefined) {
+      return { lines: [] };
+    }
+    if (modifiedContent === '') {
+      return { lines: [], modifiedContent };
+    }
+    return {
+      lines: modifiedContent.split('\n').map((l) => ({ right: l, type: 'add' as const })),
+      modifiedContent,
+    };
+  }
+
+  let diffStdout: string | undefined;
+  try {
+    const { stdout } = await execGit(
+      taskPath,
+      ['diff', '--no-color', '--unified=2000', `${commitHash}~1`, commitHash, '--', filePath],
+      { maxBuffer: MAX_DIFF_OUTPUT_BYTES }
+    );
+    diffStdout = stdout;
+  } catch {
+    // too large
+  }
+
+  let diffLines: DiffLine[] = [];
+  if (diffStdout !== undefined) {
+    const { lines, isBinary } = parseDiffLines(diffStdout);
+    if (isBinary) {
+      return { lines: [], isBinary: true };
+    }
+    diffLines = lines;
+  }
+
+  const [originalContent, modifiedContent] = await Promise.all([
+    getContentAt(`${commitHash}~1`),
+    getContentAt(commitHash),
+  ]);
+
+  if (diffLines.length > 0) return { lines: diffLines, originalContent, modifiedContent };
+
+  if (modifiedContent !== undefined && modifiedContent !== '') {
+    return {
+      lines: modifiedContent.split('\n').map((l) => ({ right: l, type: 'add' as const })),
+      originalContent,
+      modifiedContent,
+    };
+  }
+  if (originalContent !== undefined) {
+    return {
+      lines: originalContent.split('\n').map((l) => ({ left: l, type: 'del' as const })),
+      originalContent,
+      modifiedContent,
+    };
+  }
+  return { lines: [], originalContent, modifiedContent };
+}
+
+/** Soft-reset the latest commit. Returns the commit message that was reset. */
+export async function softResetLastCommit(
+  taskPath: string
+): Promise<{ subject: string; body: string }> {
+  try {
+    await execGit(taskPath, ['rev-parse', '--verify', 'HEAD~1']);
+  } catch {
+    throw new Error('Cannot undo the initial commit');
+  }
+
+  const { commits: log } = await getLog(taskPath, 1);
+  if (log[0]?.isPushed) {
+    throw new Error('Cannot undo a commit that has already been pushed');
+  }
+
+  const { stdout: subject } = await execGit(taskPath, ['log', '-1', '--pretty=format:%s']);
+  const { stdout: body } = await execGit(taskPath, ['log', '-1', '--pretty=format:%b']);
+
+  await execGit(taskPath, ['reset', '--soft', 'HEAD~1']);
+
+  return { subject: subject.trim(), body: body.trim() };
 }

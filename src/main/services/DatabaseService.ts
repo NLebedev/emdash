@@ -86,6 +86,20 @@ export interface MigrationSummary {
   recovered: boolean;
 }
 
+export class DatabaseSchemaMismatchError extends Error {
+  readonly code = 'DB_SCHEMA_MISMATCH';
+  readonly dbPath: string;
+  readonly missingInvariants: string[];
+
+  constructor(dbPath: string, missingInvariants: string[]) {
+    const suffix = missingInvariants.length > 0 ? ` (${missingInvariants.join(', ')})` : '';
+    super(`Database schema mismatch${suffix}`);
+    this.name = 'DatabaseSchemaMismatchError';
+    this.dbPath = dbPath;
+    this.missingInvariants = missingInvariants;
+  }
+}
+
 export class DatabaseService {
   private static migrationsApplied = false;
   private db: sqlite3Type.Database | null = null;
@@ -127,11 +141,19 @@ export class DatabaseService {
         }
 
         this.ensureMigrations()
-          .then(() => resolve())
-          .catch(async (migrationError) => {
-            // Track critical migration error
-            await errorTracking.captureDatabaseError(migrationError, 'initialize_migrations');
-            reject(migrationError);
+          .then(async () => {
+            await this.validateSchemaContract();
+            resolve();
+          })
+          .catch(async (initError) => {
+            const operation =
+              initError instanceof DatabaseSchemaMismatchError
+                ? 'initialize_schema_contract'
+                : 'initialize_migrations';
+            await errorTracking.captureDatabaseError(initError, operation, {
+              db_path: this.dbPath,
+            });
+            reject(initError);
           });
       });
     });
@@ -376,6 +398,15 @@ export class DatabaseService {
     return this.mapDrizzleTaskRow(rows[0]);
   }
 
+  async getTaskById(taskId: string): Promise<Task | null> {
+    if (this.disabled) return null;
+    if (!taskId) return null;
+    const { db } = await getDrizzleClient();
+    const rows = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId)).limit(1);
+    if (rows.length === 0) return null;
+    return this.mapDrizzleTaskRow(rows[0]);
+  }
+
   async deleteProject(projectId: string): Promise<void> {
     if (this.disabled) return;
     const { db } = await getDrizzleClient();
@@ -431,12 +462,13 @@ export class DatabaseService {
     return rows.map((row) => this.mapDrizzleConversationRow(row));
   }
 
-  async getOrCreateDefaultConversation(taskId: string): Promise<Conversation> {
+  async getOrCreateDefaultConversation(taskId: string, provider?: string): Promise<Conversation> {
     if (this.disabled) {
       return {
         id: `conv-${taskId}-default`,
         taskId,
         title: 'Default Conversation',
+        provider: provider ?? null,
         isMain: true,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -452,7 +484,16 @@ export class DatabaseService {
       .limit(1);
 
     if (existingRows.length > 0) {
-      return this.mapDrizzleConversationRow(existingRows[0]);
+      const existing = existingRows[0];
+      // Backfill provider if it was previously saved as null
+      if (!existing.provider && provider) {
+        await db
+          .update(conversationsTable)
+          .set({ provider, updatedAt: sql`CURRENT_TIMESTAMP` })
+          .where(eq(conversationsTable.id, existing.id));
+        return this.mapDrizzleConversationRow({ ...existing, provider });
+      }
+      return this.mapDrizzleConversationRow(existing);
     }
 
     const conversationId = `conv-${taskId}-${Date.now()}`;
@@ -460,6 +501,7 @@ export class DatabaseService {
       id: conversationId,
       taskId,
       title: 'Default Conversation',
+      provider: provider ?? null,
       isMain: true,
       isActive: true,
     });
@@ -478,6 +520,7 @@ export class DatabaseService {
       id: conversationId,
       taskId,
       title: 'Default Conversation',
+      provider: provider ?? null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -1092,6 +1135,26 @@ export class DatabaseService {
     } finally {
       // Restore FK enforcement for normal operation (and ensure it's re-enabled on failure).
       await this.execSql('PRAGMA foreign_keys=ON;');
+    }
+  }
+
+  private async validateSchemaContract(): Promise<void> {
+    if (this.disabled) return;
+
+    const missingInvariants: string[] = [];
+
+    if (!(await this.tableHasColumn('projects', 'base_ref'))) {
+      missingInvariants.push('projects.base_ref');
+    }
+    if (!(await this.tableExists('tasks'))) {
+      missingInvariants.push('tasks table');
+    }
+    if (!(await this.tableHasColumn('conversations', 'task_id'))) {
+      missingInvariants.push('conversations.task_id');
+    }
+
+    if (missingInvariants.length > 0) {
+      throw new DatabaseSchemaMismatchError(this.dbPath, missingInvariants);
     }
   }
 

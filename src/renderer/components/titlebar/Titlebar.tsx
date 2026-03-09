@@ -7,6 +7,7 @@ import {
   Settings as SettingsIcon,
   KanbanSquare,
   Code2,
+  LayoutGrid,
 } from 'lucide-react';
 import { ShortcutHint } from '../ui/shortcut-hint';
 import SidebarLeftToggleButton from './SidebarLeftToggleButton';
@@ -17,7 +18,9 @@ import OpenInMenu from './OpenInMenu';
 import FeedbackModal from '../FeedbackModal';
 import BrowserToggleButton from './BrowserToggleButton';
 import TitlebarContext from './TitlebarContext';
-import type { Project, Task } from '../../types/app';
+import { useProjectManagementContext } from '../../contexts/ProjectManagementProvider';
+import { useTaskManagementContext } from '../../contexts/TaskManagementContext';
+import { useGithubContext } from '../../contexts/GithubContextProvider';
 
 interface GithubUser {
   login?: string;
@@ -29,25 +32,9 @@ interface GithubUser {
 interface TitlebarProps {
   onToggleSettings: () => void;
   isSettingsOpen?: boolean;
-  currentPath?: string | null;
-  githubUser?: GithubUser | null;
-  defaultPreviewUrl?: string | null;
-  taskId?: string | null;
-  taskPath?: string | null;
-  projectPath?: string | null;
-  isTaskMultiAgent?: boolean;
   onToggleKanban?: () => void;
-  isKanbanOpen?: boolean;
-  kanbanAvailable?: boolean;
-  isTaskGridOpen?: boolean;
   onToggleEditor?: () => void;
-  showEditorButton?: boolean;
-  isEditorOpen?: boolean;
-  projects: Project[];
-  selectedProject: Project | null;
-  activeTask: Task | null;
-  onSelectProject: (project: Project) => void;
-  onSelectTask: (task: Task) => void;
+  onToggleTaskGrid?: () => void;
 }
 
 interface TitlebarToggleButtonProps {
@@ -106,28 +93,37 @@ function TitlebarToggleButton({
 const Titlebar: React.FC<TitlebarProps> = ({
   onToggleSettings,
   isSettingsOpen = false,
-  currentPath,
-  githubUser,
-  defaultPreviewUrl,
-  taskId,
-  taskPath,
-  projectPath,
-  isTaskMultiAgent,
   onToggleKanban,
-  isKanbanOpen = false,
-  kanbanAvailable = false,
-  isTaskGridOpen = false,
   onToggleEditor,
-  showEditorButton = false,
-  isEditorOpen = false,
-  projects,
-  selectedProject,
-  activeTask,
-  onSelectProject,
-  onSelectTask,
+  onToggleTaskGrid,
 }) => {
+  const {
+    projects,
+    selectedProject,
+    handleSelectProject: onSelectProject,
+    showKanban: isKanbanOpen,
+    showEditorMode: isEditorOpen,
+    showTaskGrid: isTaskGridOpen,
+    setShowTaskGrid,
+  } = useProjectManagementContext();
+  const { activeTask, handleSelectTask: onSelectTask } = useTaskManagementContext();
+  const { user: githubUser } = useGithubContext();
+
+  const isTaskMultiAgent = Boolean(activeTask?.metadata?.multiAgent?.enabled);
+  const currentPath = isTaskMultiAgent
+    ? null
+    : activeTask?.path ||
+      (selectedProject?.isRemote ? selectedProject?.remotePath : selectedProject?.path) ||
+      null;
+  const taskId = activeTask?.id || null;
+  const taskPath = activeTask?.path || null;
+  const projectPath = selectedProject?.path || null;
+  const kanbanAvailable = Boolean(selectedProject);
+  const showEditorButton = Boolean(activeTask);
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
+  const [isHeaderHovered, setIsHeaderHovered] = useState(false);
   const feedbackButtonRef = useRef<HTMLButtonElement | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
 
   const handleOpenFeedback = useCallback(async () => {
     void import('../../lib/telemetryClient').then(({ captureTelemetry }) => {
@@ -184,10 +180,15 @@ const Titlebar: React.FC<TitlebarProps> = ({
   return (
     <>
       <header
+        ref={headerRef}
+        onMouseEnter={() => setIsHeaderHovered(true)}
+        onMouseLeave={() => setIsHeaderHovered(false)}
         className="fixed inset-x-0 top-0 z-[80] flex h-[var(--tb,36px)] items-center justify-end bg-muted pr-2 shadow-[inset_0_-1px_0_hsl(var(--border))] [-webkit-app-region:drag] dark:bg-background"
       >
-        <div className="pointer-events-none absolute inset-x-0 flex justify-center">
-          <div className="w-[min(60vw,720px)]">
+        <div
+          className={`pointer-events-none absolute inset-x-0 flex justify-center transition-opacity duration-200 has-[[data-state=open]]:opacity-100 ${isHeaderHovered ? 'opacity-100' : 'opacity-0'}`}
+        >
+          <div className="w-[min(60vw,720px)] truncate">
             <div className="min-w-0 flex-1">
               <TitlebarContext
                 projects={projects}
@@ -257,9 +258,30 @@ const Titlebar: React.FC<TitlebarProps> = ({
               }
             />
           ) : null}
+          {selectedProject ? (
+            <TitlebarToggleButton
+              isOpen={isTaskGridOpen}
+              openLabel="Close Grid"
+              openIcon={ArrowLeft}
+              closedIcon={LayoutGrid}
+              ariaLabelOpen="Close Grid"
+              ariaLabelClosed="Show all tasks"
+              onClick={() => {
+                if (onToggleTaskGrid) {
+                  onToggleTaskGrid();
+                } else {
+                  setShowTaskGrid(!isTaskGridOpen);
+                }
+              }}
+              tooltip={
+                <div className="flex flex-col gap-1">
+                  <span>{isTaskGridOpen ? 'Close Grid' : 'Show all tasks'}</span>
+                </div>
+              }
+            />
+          ) : null}
           {taskId && !isTaskMultiAgent && !isTaskGridOpen ? (
             <BrowserToggleButton
-              defaultUrl={defaultPreviewUrl || undefined}
               taskId={taskId}
               taskPath={taskPath}
               parentProjectPath={projectPath}

@@ -1,5 +1,8 @@
 // Updated for Codex integration
 
+import type { AgentEvent } from '../../shared/agentEvents';
+import type { AutoMergeRequest } from '../lib/prStatus';
+
 type ProjectSettingsPayload = {
   projectId: string;
   name: string;
@@ -27,6 +30,8 @@ export type ProviderCustomConfig = {
   defaultArgs?: string;
   autoApproveFlag?: string;
   initialPromptFlag?: string;
+  extraArgs?: string;
+  env?: Record<string, string>;
 };
 
 export type ProviderCustomConfigs = Record<string, ProviderCustomConfig>;
@@ -63,251 +68,7 @@ declare global {
       onMenuCheckForUpdates: (listener: () => void) => () => void;
       onMenuUndo: (listener: () => void) => () => void;
       onMenuRedo: (listener: () => void) => () => void;
-
-      // App settings
-      getSettings: () => Promise<{
-        success: boolean;
-        settings?: {
-          repository: { branchPrefix: string; pushOnCreate: boolean };
-          projectPrep?: { autoInstallOnOpenInEditor: boolean };
-          browserPreview?: { enabled: boolean; engine: 'chromium' };
-          notifications?: { enabled: boolean; sound: boolean };
-          mcp?: {
-            context7?: {
-              enabled: boolean;
-              installHintsDismissed?: Record<string, boolean>;
-            };
-          };
-          defaultProvider?: string;
-          tasks?: {
-            autoGenerateName: boolean;
-            autoApproveByDefault: boolean;
-          };
-          projects?: {
-            defaultDirectory: string;
-          };
-          keyboard?: {
-            commandPalette?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            settings?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleLeftSidebar?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleRightSidebar?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleTheme?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleKanban?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleEditor?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            nextProject?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            prevProject?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            newTask?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            nextAgent?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            prevAgent?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-          };
-          interface?: {
-            autoRightSidebarBehavior?: boolean;
-            theme?: 'light' | 'dark' | 'dark-black' | 'system';
-          };
-          terminal?: {
-            fontFamily: string;
-          };
-          defaultOpenInApp?: string;
-        };
-        error?: string;
-      }>;
-      updateSettings: (
-        settings: Partial<{
-          repository: { branchPrefix?: string; pushOnCreate?: boolean };
-          projectPrep: { autoInstallOnOpenInEditor?: boolean };
-          browserPreview: { enabled?: boolean; engine?: 'chromium' };
-          notifications: { enabled?: boolean; sound?: boolean };
-          mcp: {
-            context7?: {
-              enabled?: boolean;
-              installHintsDismissed?: Record<string, boolean>;
-            };
-          };
-          defaultProvider?: string;
-          tasks?: {
-            autoGenerateName?: boolean;
-            autoApproveByDefault?: boolean;
-          };
-          projects?: {
-            defaultDirectory?: string;
-          };
-          keyboard?: {
-            commandPalette?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            settings?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleLeftSidebar?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleRightSidebar?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleTheme?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleKanban?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleEditor?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            nextProject?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            prevProject?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            newTask?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            nextAgent?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            prevAgent?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-          };
-          interface?: {
-            autoRightSidebarBehavior?: boolean;
-            theme?: 'light' | 'dark' | 'dark-black' | 'system';
-          };
-          terminal?: {
-            fontFamily?: string;
-          };
-          defaultOpenInApp?: string;
-        }>
-      ) => Promise<{
-        success: boolean;
-        settings?: {
-          repository: { branchPrefix: string; pushOnCreate: boolean };
-          projectPrep?: { autoInstallOnOpenInEditor: boolean };
-          browserPreview?: { enabled: boolean; engine: 'chromium' };
-          notifications?: { enabled: boolean; sound: boolean };
-          mcp?: {
-            context7?: {
-              enabled: boolean;
-              installHintsDismissed?: Record<string, boolean>;
-            };
-          };
-          defaultProvider?: string;
-          tasks?: {
-            autoGenerateName: boolean;
-            autoApproveByDefault: boolean;
-          };
-          projects?: {
-            defaultDirectory: string;
-          };
-          keyboard?: {
-            commandPalette?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            settings?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleLeftSidebar?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleRightSidebar?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleTheme?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleKanban?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            toggleEditor?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            nextProject?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            prevProject?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            newTask?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            nextAgent?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-            prevAgent?: {
-              key: string;
-              modifier: 'cmd' | 'ctrl' | 'shift' | 'alt' | 'option' | 'cmd+shift' | 'ctrl+shift';
-            };
-          };
-          interface?: {
-            autoRightSidebarBehavior?: boolean;
-            theme?: 'light' | 'dark' | 'dark-black' | 'system';
-          };
-          terminal?: {
-            fontFamily: string;
-          };
-          defaultOpenInApp?: string;
-        };
-        error?: string;
-      }>;
+      onMenuCloseTab: (listener: () => void) => () => void;
 
       // PTY
       ptyStart: (opts: {
@@ -321,7 +82,7 @@ declare global {
         autoApprove?: boolean;
         initialPrompt?: string;
         skipResume?: boolean;
-      }) => Promise<{ ok: boolean; error?: string }>;
+      }) => Promise<{ ok: boolean; tmux?: boolean; error?: string }>;
       ptyStartDirect: (opts: {
         id: string;
         providerId: string;
@@ -333,7 +94,7 @@ declare global {
         initialPrompt?: string;
         env?: Record<string, string>;
         resume?: boolean;
-      }) => Promise<{ ok: boolean; reused?: boolean; error?: string }>;
+      }) => Promise<{ ok: boolean; reused?: boolean; tmux?: boolean; error?: string }>;
       ptyScpToRemote: (args: { connectionId: string; localPaths: string[] }) => Promise<{
         success: boolean;
         remotePaths?: string[];
@@ -343,6 +104,7 @@ declare global {
       ptyInput: (args: { id: string; data: string }) => void;
       ptyResize: (args: { id: string; cols: number; rows?: number }) => void;
       ptyKill: (id: string) => void;
+      ptyKillTmux: (id: string) => Promise<{ ok: boolean; error?: string }>;
       onPtyData: (id: string, listener: (data: string) => void) => () => void;
       ptyGetSnapshot: (args: { id: string }) => Promise<{
         ok: boolean;
@@ -354,11 +116,25 @@ declare global {
         error?: string;
       }>;
       ptyClearSnapshot: (args: { id: string }) => Promise<{ ok: boolean }>;
+      ptyCleanupSessions: (args: {
+        ids: string[];
+        clearSnapshots?: boolean;
+        waitForSnapshots?: boolean;
+      }) => Promise<{
+        ok: boolean;
+        cleaned: number;
+        failedIds: string[];
+        snapshotClearQueued: boolean;
+      }>;
       onPtyExit: (
         id: string,
         listener: (info: { exitCode: number; signal?: number }) => void
       ) => () => void;
       onPtyStarted: (listener: (data: { id: string }) => void) => () => void;
+      onAgentEvent: (
+        listener: (event: AgentEvent, meta: { appFocused: boolean }) => void
+      ) => () => void;
+      onNotificationFocusTask: (listener: (taskId: string) => void) => () => void;
       terminalGetTheme: () => Promise<{
         ok: boolean;
         config?: {
@@ -445,8 +221,30 @@ declare global {
         needsBaseRefSwitch?: boolean;
         error?: string;
       }>;
+      worktreeClaimReserveAndSaveTask: (args: {
+        projectId: string;
+        projectPath: string;
+        taskName: string;
+        baseRef?: string;
+        task: {
+          projectId: string;
+          name: string;
+          status: 'active' | 'idle' | 'running';
+          agentId?: string | null;
+          metadata?: any;
+          useWorktree?: boolean;
+        };
+      }) => Promise<{
+        success: boolean;
+        worktree?: any;
+        task?: any;
+        needsBaseRefSwitch?: boolean;
+        error?: string;
+      }>;
       worktreeRemoveReserve: (args: {
         projectId: string;
+        projectPath?: string;
+        isRemote?: boolean;
       }) => Promise<{ success: boolean; error?: string }>;
 
       // Lifecycle scripts
@@ -458,11 +256,13 @@ declare global {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
       lifecycleRunStart: (args: {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
       lifecycleRunStop: (args: {
         taskId: string;
@@ -471,6 +271,7 @@ declare global {
         taskId: string;
         taskPath: string;
         projectPath: string;
+        taskName?: string;
       }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
       lifecycleGetState: (args: { taskId: string }) => Promise<{
         success: boolean;
@@ -501,6 +302,11 @@ declare global {
         };
         error?: string;
       }>;
+      lifecycleGetLogs: (args: { taskId: string }) => Promise<{
+        success: boolean;
+        logs?: { setup: string[]; run: string[]; teardown: string[] };
+        error?: string;
+      }>;
       lifecycleClearTask: (args: {
         taskId: string;
       }) => Promise<{ success: boolean; error?: string }>;
@@ -508,6 +314,15 @@ declare global {
 
       // Project management
       openProject: () => Promise<{
+        success: boolean;
+        path?: string;
+        error?: string;
+      }>;
+      openFile: (args?: {
+        title?: string;
+        message?: string;
+        filters?: Electron.FileFilter[];
+      }) => Promise<{
         success: boolean;
         path?: string;
         error?: string;
@@ -551,6 +366,32 @@ declare global {
         }>;
         error?: string;
       }>;
+      getDeleteRisks: (args: {
+        targets: Array<{ id: string; taskPath: string }>;
+        includePr?: boolean;
+      }) => Promise<{
+        success: boolean;
+        risks?: Record<
+          string,
+          {
+            staged: number;
+            unstaged: number;
+            untracked: number;
+            ahead: number;
+            behind: number;
+            error?: string;
+            pr?: {
+              number?: number;
+              title?: string;
+              url?: string;
+              state?: string | null;
+              isDraft?: boolean;
+            } | null;
+            prKnown: boolean;
+          }
+        >;
+        error?: string;
+      }>;
       watchGitStatus: (taskPath: string) => Promise<{
         success: boolean;
         watchId?: string;
@@ -578,6 +419,9 @@ declare global {
             right?: string;
             type: 'context' | 'add' | 'del';
           }>;
+          isBinary?: boolean;
+          originalContent?: string;
+          modifiedContent?: string;
         };
         error?: string;
       }>;
@@ -618,6 +462,81 @@ declare global {
       revertFile: (args: { taskPath: string; filePath: string }) => Promise<{
         success: boolean;
         action?: 'unstaged' | 'reverted';
+        error?: string;
+      }>;
+      gitCommit: (args: { taskPath: string; message: string }) => Promise<{
+        success: boolean;
+        hash?: string;
+        error?: string;
+      }>;
+      gitPush: (args: { taskPath: string }) => Promise<{
+        success: boolean;
+        output?: string;
+        error?: string;
+      }>;
+      gitPull: (args: { taskPath: string }) => Promise<{
+        success: boolean;
+        output?: string;
+        error?: string;
+      }>;
+      gitGetLog: (args: {
+        taskPath: string;
+        maxCount?: number;
+        skip?: number;
+        aheadCount?: number;
+      }) => Promise<{
+        success: boolean;
+        commits?: Array<{
+          hash: string;
+          subject: string;
+          body: string;
+          author: string;
+          authorEmail: string;
+          date: string;
+          isPushed: boolean;
+          tags: string[];
+        }>;
+        aheadCount?: number;
+        error?: string;
+      }>;
+      gitGetLatestCommit: (args: { taskPath: string }) => Promise<{
+        success: boolean;
+        commit?: {
+          hash: string;
+          subject: string;
+          body: string;
+          isPushed: boolean;
+        } | null;
+        error?: string;
+      }>;
+      gitGetCommitFiles: (args: { taskPath: string; commitHash: string }) => Promise<{
+        success: boolean;
+        files?: Array<{
+          path: string;
+          status: string;
+          additions: number;
+          deletions: number;
+        }>;
+        error?: string;
+      }>;
+      gitGetCommitFileDiff: (args: {
+        taskPath: string;
+        commitHash: string;
+        filePath: string;
+      }) => Promise<{
+        success: boolean;
+        diff?: {
+          lines: Array<{ left?: string; right?: string; type: 'context' | 'add' | 'del' }>;
+          isBinary?: boolean;
+          originalContent?: string;
+          modifiedContent?: string;
+        };
+        error?: string;
+      }>;
+      gitSoftReset: (args: { taskPath: string }) => Promise<{
+        success: boolean;
+        subject?: string;
+        body?: string;
         error?: string;
       }>;
       gitCommitAndPush: (args: {
@@ -665,6 +584,17 @@ declare global {
         prUrl?: string;
         error?: string;
       }>;
+      mergePr: (args: {
+        taskPath: string;
+        prNumber?: number;
+        strategy?: 'merge' | 'squash' | 'rebase';
+        admin?: boolean;
+      }) => Promise<{
+        success: boolean;
+        output?: string;
+        error?: string;
+        code?: string;
+      }>;
       getPrStatus: (args: { taskPath: string }) => Promise<{
         success: boolean;
         pr?: {
@@ -680,7 +610,22 @@ declare global {
           additions?: number;
           deletions?: number;
           changedFiles?: number;
+          autoMergeRequest?: AutoMergeRequest | null;
         } | null;
+        error?: string;
+      }>;
+      enableAutoMerge: (args: {
+        taskPath: string;
+        prNumber?: number;
+        strategy?: 'merge' | 'squash' | 'rebase';
+      }) => Promise<{
+        success: boolean;
+        output?: string;
+        error?: string;
+      }>;
+      disableAutoMerge: (args: { taskPath: string; prNumber?: number }) => Promise<{
+        success: boolean;
+        output?: string;
         error?: string;
       }>;
       getCheckRuns: (args: { taskPath: string }) => Promise<{
@@ -723,6 +668,7 @@ declare global {
         defaultBranch?: string;
         ahead?: number;
         behind?: number;
+        aheadOfDefault?: number;
         error?: string;
       }>;
       renameBranch: (args: { repoPath: string; oldBranch: string; newBranch: string }) => Promise<{
@@ -737,6 +683,7 @@ declare global {
       }>;
       openExternal: (url: string) => Promise<{ success: boolean; error?: string }>;
       clipboardWriteText: (text: string) => Promise<{ success: boolean; error?: string }>;
+      paste: () => Promise<{ success: boolean; error?: string }>;
       openIn: (args: {
         app: OpenInAppId;
         path: string;
@@ -798,6 +745,7 @@ declare global {
           timeBudgetMs?: number;
           connectionId?: string;
           remotePath?: string;
+          recursive?: boolean;
         }
       ) => Promise<{
         success: boolean;
@@ -1022,6 +970,58 @@ declare global {
         searchTerm: string,
         limit?: number
       ) => Promise<{ success: boolean; issues?: any[]; error?: string }>;
+      // GitLab
+      gitlabSaveCredentials?: (args: {
+        instanceUrl: string;
+        token: string;
+      }) => Promise<{ success: boolean; displayName?: string; error?: string }>;
+      gitlabClearCredentials?: () => Promise<{ success: boolean; error?: string }>;
+      gitlabCheckConnection?: () => Promise<{
+        success: boolean;
+        username?: string;
+        instanceUrl?: string;
+        error?: string;
+      }>;
+      gitlabInitialFetch?: (
+        projectPath: string,
+        limit?: number
+      ) => Promise<{ success: boolean; issues?: any[]; error?: string }>;
+      gitlabSearchIssues?: (
+        projectPath: string,
+        searchTerm: string,
+        limit?: number
+      ) => Promise<{ success: boolean; issues?: any[]; error?: string }>;
+      // Plain integration
+      plainSaveToken?: (token: string) => Promise<{
+        success: boolean;
+        workspaceName?: string;
+        error?: string;
+      }>;
+      plainCheckConnection?: () => Promise<{
+        connected: boolean;
+        workspaceName?: string;
+        error?: string;
+      }>;
+      plainClearToken?: () => Promise<{
+        success: boolean;
+        error?: string;
+      }>;
+      plainInitialFetch?: (
+        limit?: number,
+        statuses?: string[]
+      ) => Promise<{
+        success: boolean;
+        threads?: any[];
+        error?: string;
+      }>;
+      plainSearchThreads?: (
+        searchTerm: string,
+        limit?: number
+      ) => Promise<{
+        success: boolean;
+        threads?: any[];
+        error?: string;
+      }>;
       getProviderStatuses?: (opts?: {
         refresh?: boolean;
         providers?: string[];
@@ -1054,58 +1054,6 @@ declare global {
         success: boolean;
         error?: string;
       }>;
-
-      // Database operations
-      getProjects: () => Promise<any[]>;
-      saveProject: (project: any) => Promise<{ success: boolean; error?: string }>;
-      getTasks: (projectId?: string) => Promise<any[]>;
-      saveTask: (task: any) => Promise<{ success: boolean; error?: string }>;
-      deleteProject: (projectId: string) => Promise<{ success: boolean; error?: string }>;
-      deleteTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
-      archiveTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
-      restoreTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
-      getArchivedTasks: (projectId?: string) => Promise<any[]>;
-
-      // Conversation and Message operations
-      saveConversation: (conversation: any) => Promise<{ success: boolean; error?: string }>;
-      getConversations: (
-        taskId: string
-      ) => Promise<{ success: boolean; conversations?: any[]; error?: string }>;
-      deleteConversation: (conversationId: string) => Promise<{ success: boolean; error?: string }>;
-      cleanupSessionDirectory: (args: {
-        taskPath: string;
-        conversationId: string;
-      }) => Promise<{ success: boolean }>;
-      saveMessage: (message: any) => Promise<{ success: boolean; error?: string }>;
-      getMessages: (
-        conversationId: string
-      ) => Promise<{ success: boolean; messages?: any[]; error?: string }>;
-      getOrCreateDefaultConversation: (
-        taskId: string
-      ) => Promise<{ success: boolean; conversation?: any; error?: string }>;
-
-      // Multi-chat support
-      createConversation: (params: {
-        taskId: string;
-        title: string;
-        provider?: string;
-        isMain?: boolean;
-      }) => Promise<{ success: boolean; conversation?: any; error?: string }>;
-      setActiveConversation: (params: {
-        taskId: string;
-        conversationId: string;
-      }) => Promise<{ success: boolean; error?: string }>;
-      getActiveConversation: (
-        taskId: string
-      ) => Promise<{ success: boolean; conversation?: any; error?: string }>;
-      reorderConversations: (params: {
-        taskId: string;
-        conversationIds: string[];
-      }) => Promise<{ success: boolean; error?: string }>;
-      updateConversationTitle: (params: {
-        conversationId: string;
-        title: string;
-      }) => Promise<{ success: boolean; error?: string }>;
 
       // Debug helpers
       debugAppendLog: (
@@ -1166,7 +1114,7 @@ declare global {
         useAgent?: boolean;
         password?: string;
         passphrase?: string;
-      }) => Promise<{ success: boolean; error?: string; latency?: number }>;
+      }) => Promise<{ success: boolean; error?: string; latency?: number; debugLogs?: string[] }>;
       sshSaveConnection: (config: {
         id?: string;
         name: string;
@@ -1257,6 +1205,9 @@ declare global {
         };
         error?: string;
       }>;
+      sshCheckIsGitRepo: (connectionId: string, remotePath: string) => Promise<boolean>;
+      sshInitRepo: (connectionId: string, parentPath: string, repoName: string) => Promise<string>;
+      sshCloneRepo: (connectionId: string, repoUrl: string, targetPath: string) => Promise<string>;
 
       // Skills management
       skillsGetCatalog: () => Promise<{
@@ -1288,9 +1239,34 @@ declare global {
         data?: import('@shared/skills/types').DetectedAgent[];
         error?: string;
       }>;
-      skillsCreate: (args: { name: string; description: string }) => Promise<{
+      skillsCreate: (args: { name: string; description: string; content?: string }) => Promise<{
         success: boolean;
         data?: import('@shared/skills/types').CatalogSkill;
+        error?: string;
+      }>;
+
+      // MCP
+      mcpLoadAll: () => Promise<{
+        success: boolean;
+        data?: import('../../shared/mcp/types').McpLoadAllResponse;
+        error?: string;
+      }>;
+      mcpSaveServer: (server: import('../../shared/mcp/types').McpServer) => Promise<{
+        success: boolean;
+        error?: string;
+      }>;
+      mcpRemoveServer: (serverName: string) => Promise<{
+        success: boolean;
+        error?: string;
+      }>;
+      mcpGetProviders: () => Promise<{
+        success: boolean;
+        data?: import('../../shared/mcp/types').McpProvidersResponse[];
+        error?: string;
+      }>;
+      mcpRefreshProviders: () => Promise<{
+        success: boolean;
+        data?: import('../../shared/mcp/types').McpProvidersResponse[];
         error?: string;
       }>;
     };
@@ -1304,6 +1280,7 @@ export interface ElectronAPI {
   onMenuCheckForUpdates: (listener: () => void) => () => void;
   onMenuUndo: (listener: () => void) => () => void;
   onMenuRedo: (listener: () => void) => () => void;
+  onMenuCloseTab: (listener: () => void) => () => void;
 
   // App info
   getVersion: () => Promise<string>;
@@ -1337,7 +1314,7 @@ export interface ElectronAPI {
     autoApprove?: boolean;
     initialPrompt?: string;
     skipResume?: boolean;
-  }) => Promise<{ ok: boolean; error?: string }>;
+  }) => Promise<{ ok: boolean; tmux?: boolean; error?: string }>;
   ptyStartDirect: (opts: {
     id: string;
     providerId: string;
@@ -1348,7 +1325,7 @@ export interface ElectronAPI {
     initialPrompt?: string;
     env?: Record<string, string>;
     resume?: boolean;
-  }) => Promise<{ ok: boolean; reused?: boolean; error?: string }>;
+  }) => Promise<{ ok: boolean; reused?: boolean; tmux?: boolean; error?: string }>;
   ptyScpToRemote: (args: { connectionId: string; localPaths: string[] }) => Promise<{
     success: boolean;
     remotePaths?: string[];
@@ -1358,6 +1335,7 @@ export interface ElectronAPI {
   ptyInput: (args: { id: string; data: string }) => void;
   ptyResize: (args: { id: string; cols: number; rows?: number }) => void;
   ptyKill: (id: string) => void;
+  ptyKillTmux: (id: string) => Promise<{ ok: boolean; error?: string }>;
   onPtyData: (id: string, listener: (data: string) => void) => () => void;
   ptyGetSnapshot: (args: { id: string }) => Promise<{
     ok: boolean;
@@ -1369,11 +1347,25 @@ export interface ElectronAPI {
     error?: string;
   }>;
   ptyClearSnapshot: (args: { id: string }) => Promise<{ ok: boolean }>;
+  ptyCleanupSessions: (args: {
+    ids: string[];
+    clearSnapshots?: boolean;
+    waitForSnapshots?: boolean;
+  }) => Promise<{
+    ok: boolean;
+    cleaned: number;
+    failedIds: string[];
+    snapshotClearQueued: boolean;
+  }>;
   onPtyExit: (
     id: string,
     listener: (info: { exitCode: number; signal?: number }) => void
   ) => () => void;
   onPtyStarted: (listener: (data: { id: string }) => void) => () => void;
+  onAgentEvent: (
+    listener: (event: AgentEvent, meta: { appFocused: boolean }) => void
+  ) => () => void;
+  onNotificationFocusTask: (listener: (taskId: string) => void) => () => void;
 
   // Worktree management
   worktreeCreate: (args: {
@@ -1428,8 +1420,30 @@ export interface ElectronAPI {
     needsBaseRefSwitch?: boolean;
     error?: string;
   }>;
+  worktreeClaimReserveAndSaveTask: (args: {
+    projectId: string;
+    projectPath: string;
+    taskName: string;
+    baseRef?: string;
+    task: {
+      projectId: string;
+      name: string;
+      status: 'active' | 'idle' | 'running';
+      agentId?: string | null;
+      metadata?: any;
+      useWorktree?: boolean;
+    };
+  }) => Promise<{
+    success: boolean;
+    worktree?: any;
+    task?: any;
+    needsBaseRefSwitch?: boolean;
+    error?: string;
+  }>;
   worktreeRemoveReserve: (args: {
     projectId: string;
+    projectPath?: string;
+    isRemote?: boolean;
   }) => Promise<{ success: boolean; error?: string }>;
 
   // Lifecycle scripts
@@ -1441,11 +1455,13 @@ export interface ElectronAPI {
     taskId: string;
     taskPath: string;
     projectPath: string;
+    taskName?: string;
   }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
   lifecycleRunStart: (args: {
     taskId: string;
     taskPath: string;
     projectPath: string;
+    taskName?: string;
   }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
   lifecycleRunStop: (args: {
     taskId: string;
@@ -1454,6 +1470,7 @@ export interface ElectronAPI {
     taskId: string;
     taskPath: string;
     projectPath: string;
+    taskName?: string;
   }) => Promise<{ success: boolean; skipped?: boolean; error?: string }>;
   lifecycleGetState: (args: { taskId: string }) => Promise<{
     success: boolean;
@@ -1484,11 +1501,25 @@ export interface ElectronAPI {
     };
     error?: string;
   }>;
+  lifecycleGetLogs: (args: { taskId: string }) => Promise<{
+    success: boolean;
+    logs?: { setup: string[]; run: string[]; teardown: string[] };
+    error?: string;
+  }>;
   lifecycleClearTask: (args: { taskId: string }) => Promise<{ success: boolean; error?: string }>;
   onLifecycleEvent: (listener: (data: any) => void) => () => void;
 
   // Project management
   openProject: () => Promise<{
+    success: boolean;
+    path?: string;
+    error?: string;
+  }>;
+  openFile: (args?: {
+    title?: string;
+    message?: string;
+    filters?: Electron.FileFilter[];
+  }) => Promise<{
     success: boolean;
     path?: string;
     error?: string;
@@ -1754,25 +1785,37 @@ export interface ElectronAPI {
     error?: string;
   }>;
 
-  // Database operations
-  getProjects: () => Promise<any[]>;
-  saveProject: (project: any) => Promise<{ success: boolean; error?: string }>;
-  getTasks: (projectId?: string) => Promise<any[]>;
-  saveTask: (task: any) => Promise<{ success: boolean; error?: string }>;
-  deleteProject: (projectId: string) => Promise<{ success: boolean; error?: string }>;
-  deleteTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
-  archiveTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
-  restoreTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
-  getArchivedTasks: (projectId?: string) => Promise<any[]>;
-
-  // Message operations
-  saveMessage: (message: any) => Promise<{ success: boolean; error?: string }>;
-  getMessages: (
-    conversationId: string
-  ) => Promise<{ success: boolean; messages?: any[]; error?: string }>;
-  getOrCreateDefaultConversation: (
-    taskId: string
-  ) => Promise<{ success: boolean; conversation?: any; error?: string }>;
+  // Plain integration
+  plainSaveToken?: (token: string) => Promise<{
+    success: boolean;
+    workspaceName?: string;
+    error?: string;
+  }>;
+  plainCheckConnection?: () => Promise<{
+    connected: boolean;
+    workspaceName?: string;
+    error?: string;
+  }>;
+  plainClearToken?: () => Promise<{
+    success: boolean;
+    error?: string;
+  }>;
+  plainInitialFetch?: (
+    limit?: number,
+    statuses?: string[]
+  ) => Promise<{
+    success: boolean;
+    threads?: any[];
+    error?: string;
+  }>;
+  plainSearchThreads?: (
+    searchTerm: string,
+    limit?: number
+  ) => Promise<{
+    success: boolean;
+    threads?: any[];
+    error?: string;
+  }>;
 
   // Debug helpers
   debugAppendLog: (
@@ -1854,6 +1897,31 @@ export interface ElectronAPI {
   skillsCreate: (args: { name: string; description: string }) => Promise<{
     success: boolean;
     data?: import('@shared/skills/types').CatalogSkill;
+    error?: string;
+  }>;
+
+  // MCP
+  mcpLoadAll: () => Promise<{
+    success: boolean;
+    data?: import('../../shared/mcp/types').McpLoadAllResponse;
+    error?: string;
+  }>;
+  mcpSaveServer: (server: import('../../shared/mcp/types').McpServer) => Promise<{
+    success: boolean;
+    error?: string;
+  }>;
+  mcpRemoveServer: (serverName: string) => Promise<{
+    success: boolean;
+    error?: string;
+  }>;
+  mcpGetProviders: () => Promise<{
+    success: boolean;
+    data?: import('../../shared/mcp/types').McpProvidersResponse[];
+    error?: string;
+  }>;
+  mcpRefreshProviders: () => Promise<{
+    success: boolean;
+    data?: import('../../shared/mcp/types').McpProvidersResponse[];
     error?: string;
   }>;
 }

@@ -3,6 +3,7 @@ import { URL } from 'node:url';
 import { app } from 'electron';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { sortByUpdatedAtDesc } from '../utils/issueSorting';
 
 type JiraCreds = { siteUrl: string; email: string };
 
@@ -23,6 +24,7 @@ export default class JiraService {
   private readonly SERVICE = 'emdash-jira';
   private readonly ACCOUNT = 'api-token';
   private readonly CONF_FILE = join(app.getPath('userData'), 'jira.json');
+  private projectKeys: string[] = [];
 
   private readCreds(): JiraCreds | null {
     try {
@@ -71,6 +73,7 @@ export default class JiraService {
   async clearCredentials(): Promise<{ success: boolean; error?: string }> {
     try {
       const keytar = await import('keytar');
+      this.projectKeys = [];
       try {
         await keytar.deletePassword(this.SERVICE, this.ACCOUNT);
       } catch {}
@@ -95,6 +98,11 @@ export default class JiraService {
       const token = await keytar.getPassword(this.SERVICE, this.ACCOUNT);
       if (!token) return { connected: false };
       const me = await this.getMyself(creds.siteUrl, creds.email, token);
+      this.fetchProjectKeys(creds.siteUrl, creds.email, token)
+        .then((keys) => {
+          this.projectKeys = keys;
+        })
+        .catch(() => {});
       return {
         connected: true,
         accountId: me?.accountId,
@@ -119,7 +127,7 @@ export default class JiraService {
     for (const jql of jqlCandidates) {
       try {
         const issues = await this.searchRaw(siteUrl, email, token, jql, limit);
-        if (issues.length > 0) return this.normalizeIssues(siteUrl, issues);
+        if (issues.length > 0) return sortByUpdatedAtDesc(this.normalizeIssues(siteUrl, issues));
       } catch {
         // Try next candidate if this one is forbidden or failed
       }
@@ -137,7 +145,7 @@ export default class JiraService {
             // skip individual failures
           }
         }
-        if (results.length > 0) return this.normalizeIssues(siteUrl, results);
+        if (results.length > 0) return sortByUpdatedAtDesc(this.normalizeIssues(siteUrl, results));
       }
     } catch {
       // ignore
@@ -153,7 +161,7 @@ export default class JiraService {
     const inner = `text ~ \"${sanitized}\" OR key = ${term}`;
     const jql = inner;
     const data = await this.searchRaw(siteUrl, email, token, jql, limit);
-    return this.normalizeIssues(siteUrl, data);
+    return sortByUpdatedAtDesc(this.normalizeIssues(siteUrl, data));
   }
 
   private async requireAuth(): Promise<{ siteUrl: string; email: string; token: string }> {
@@ -254,7 +262,7 @@ export default class JiraService {
       const keyUpper = term.toUpperCase();
       try {
         const issue = await this.getIssueByKey(siteUrl, email, token, keyUpper);
-        if (issue) return this.normalizeIssues(siteUrl, [issue]);
+        if (issue) return sortByUpdatedAtDesc(this.normalizeIssues(siteUrl, [issue]));
       } catch {
         // If direct fetch fails (404/403/etc.), falling back to JQL search below
       }
@@ -263,10 +271,26 @@ export default class JiraService {
     // Build JQL safely (escape quotes in term)
     const sanitized = term.replace(/"/g, '\\"');
     const extraKey = looksLikeKey ? ` OR issueKey = ${term.toUpperCase()}` : '';
-    const inner = `text ~ \"${sanitized}\"${extraKey}`;
-    const jql = inner;
+    const isNumeric = /^\d+$/.test(term);
+    const keyClause =
+      isNumeric && this.projectKeys.length
+        ? ` OR key IN (${this.projectKeys.map((p) => `"${p}-${term}"`).join(',')})`
+        : '';
+    const jql = `text ~ "${sanitized}"${extraKey}${keyClause}`;
     const data = await this.searchRaw(siteUrl, email, token, jql, limit);
-    return this.normalizeIssues(siteUrl, data);
+    return sortByUpdatedAtDesc(this.normalizeIssues(siteUrl, data));
+  }
+
+  private async fetchProjectKeys(siteUrl: string, email: string, token: string): Promise<string[]> {
+    try {
+      const url = new URL('/rest/api/3/project', siteUrl);
+      const body = await this.doGet(url, email, token);
+      const data = JSON.parse(body || '[]');
+      if (!Array.isArray(data)) return [];
+      return data.map((p: any) => String(p?.key || '')).filter(Boolean);
+    } catch {
+      return [];
+    }
   }
 
   private async getIssueByKey(

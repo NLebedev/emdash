@@ -1,113 +1,44 @@
-import { useEffect, useState } from 'react';
+import { useAppSettings } from '@/contexts/AppSettingsProvider';
 
-export type TaskSettingsErrorScope = 'autoGenerateName' | 'autoApproveByDefault' | 'load' | null;
+export type TaskSettingsErrorScope =
+  | 'autoGenerateName'
+  | 'autoApproveByDefault'
+  | 'createWorktreeByDefault'
+  | 'autoTrustWorktrees'
+  | 'load'
+  | null;
 
 export interface TaskSettingsModel {
   autoGenerateName: boolean;
   autoApproveByDefault: boolean;
+  createWorktreeByDefault: boolean;
+  autoTrustWorktrees: boolean;
   loading: boolean;
   saving: boolean;
   error: string | null;
   errorScope: TaskSettingsErrorScope;
-  updateAutoGenerateName: (next: boolean) => Promise<void>;
-  updateAutoApproveByDefault: (next: boolean) => Promise<void>;
+  updateAutoGenerateName: (next: boolean) => void;
+  updateAutoApproveByDefault: (next: boolean) => void;
+  updateCreateWorktreeByDefault: (next: boolean) => void;
+  updateAutoTrustWorktrees: (next: boolean) => void;
 }
 
 export function useTaskSettings(): TaskSettingsModel {
-  const [autoGenerateName, setAutoGenerateName] = useState(true);
-  const [autoApproveByDefault, setAutoApproveByDefault] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [errorScope, setErrorScope] = useState<TaskSettingsErrorScope>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const result = await window.electronAPI.getSettings();
-        if (cancelled) return;
-        if (result.success) {
-          setAutoGenerateName(result.settings?.tasks?.autoGenerateName ?? true);
-          setAutoApproveByDefault(result.settings?.tasks?.autoApproveByDefault ?? false);
-          setError(null);
-          setErrorScope(null);
-        } else {
-          setError(result.error || 'Failed to load settings.');
-          setErrorScope('load');
-        }
-      } catch (err) {
-        if (!cancelled) {
-          const message = err instanceof Error ? err.message : 'Failed to load settings.';
-          setError(message);
-          setErrorScope('load');
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const updateAutoGenerateName = async (next: boolean) => {
-    const previous = autoGenerateName;
-    setAutoGenerateName(next);
-    setError(null);
-    setErrorScope(null);
-    setSaving(true);
-    try {
-      const result = await window.electronAPI.updateSettings({ tasks: { autoGenerateName: next } });
-      if (!result.success) {
-        throw new Error(result.error || 'Failed to update settings.');
-      }
-      setAutoGenerateName(result.settings?.tasks?.autoGenerateName ?? next);
-      setAutoApproveByDefault(result.settings?.tasks?.autoApproveByDefault ?? autoApproveByDefault);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to update settings.';
-      setAutoGenerateName(previous);
-      setError(message);
-      setErrorScope('autoGenerateName');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const updateAutoApproveByDefault = async (next: boolean) => {
-    const previous = autoApproveByDefault;
-    setAutoApproveByDefault(next);
-    setError(null);
-    setErrorScope(null);
-    setSaving(true);
-    try {
-      const result = await window.electronAPI.updateSettings({
-        tasks: { autoApproveByDefault: next },
-      });
-      if (!result.success) {
-        throw new Error(result.error || 'Failed to update settings.');
-      }
-      setAutoGenerateName(result.settings?.tasks?.autoGenerateName ?? autoGenerateName);
-      setAutoApproveByDefault(result.settings?.tasks?.autoApproveByDefault ?? next);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to update settings.';
-      setAutoApproveByDefault(previous);
-      setError(message);
-      setErrorScope('autoApproveByDefault');
-    } finally {
-      setSaving(false);
-    }
-  };
-
+  const { settings, updateSettings, isLoading: loading, isSaving: saving } = useAppSettings();
+  const tasks = settings?.tasks;
   return {
-    autoGenerateName,
-    autoApproveByDefault,
+    autoGenerateName: tasks?.autoGenerateName ?? true,
+    autoApproveByDefault: tasks?.autoApproveByDefault ?? false,
+    createWorktreeByDefault: tasks?.createWorktreeByDefault ?? true,
+    autoTrustWorktrees: tasks?.autoTrustWorktrees ?? true,
     loading,
     saving,
-    error,
-    errorScope,
-    updateAutoGenerateName,
-    updateAutoApproveByDefault,
+    error: null,
+    errorScope: null,
+    updateAutoGenerateName: (next) => updateSettings({ tasks: { autoGenerateName: next } }),
+    updateAutoApproveByDefault: (next) => updateSettings({ tasks: { autoApproveByDefault: next } }),
+    updateCreateWorktreeByDefault: (next) =>
+      updateSettings({ tasks: { createWorktreeByDefault: next } }),
+    updateAutoTrustWorktrees: (next) => updateSettings({ tasks: { autoTrustWorktrees: next } }),
   };
 }

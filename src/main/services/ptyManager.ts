@@ -9,6 +9,8 @@ import { parsePtyId } from '@shared/ptyId';
 import { providerStatusCache } from './providerStatusCache';
 import { errorTracking } from '../errorTracking';
 import { getProviderCustomConfig } from '../settings';
+import { agentEventService } from './AgentEventService';
+import { OpenCodeHookService } from './OpenCodeHookService';
 
 /**
  * Environment variables to pass through for agent authentication.
@@ -17,6 +19,7 @@ import { getProviderCustomConfig } from '../settings';
 const AGENT_ENV_VARS = [
   'AMP_API_KEY',
   'ANTHROPIC_API_KEY',
+  'AUTOHAND_API_KEY',
   'AUGMENT_SESSION_AUTH',
   'AWS_ACCESS_KEY_ID',
   'AWS_DEFAULT_REGION',
@@ -57,11 +60,169 @@ type PtyRecord = {
   kind?: 'local' | 'ssh';
   cols?: number;
   rows?: number;
+  tmuxSessionName?: string; // Set when session is wrapped in tmux
 };
 
 const ptys = new Map<string, PtyRecord>();
 const MIN_PTY_COLS = 2;
 const MIN_PTY_ROWS = 1;
+
+function applyAgentEventHookEnv(env: Record<string, string>, ptyId: string): void {
+  const hookPort = agentEventService.getPort();
+  if (hookPort <= 0) return;
+
+  env['EMDASH_HOOK_PORT'] = String(hookPort);
+  env['EMDASH_PTY_ID'] = ptyId;
+  env['EMDASH_HOOK_TOKEN'] = agentEventService.getToken();
+}
+
+function applyOpenCodeRuntimeEnv(
+  env: Record<string, string>,
+  ptyId: string,
+  providerId?: string
+): void {
+  if (providerId !== 'opencode') return;
+
+  env['OPENCODE_CONFIG_DIR'] = OpenCodeHookService.writeLocalPlugin(ptyId);
+}
+
+function applyProviderSpecificRuntimeEnv(
+  env: Record<string, string>,
+  options: {
+    ptyId: string;
+    providerId?: string;
+  }
+): void {
+  applyOpenCodeRuntimeEnv(env, options.ptyId, options.providerId);
+}
+
+export function applyProviderRuntimeEnv(
+  env: Record<string, string>,
+  options: {
+    ptyId: string;
+    providerId?: string;
+  }
+): void {
+  applyAgentEventHookEnv(env, options.ptyId);
+  applyProviderSpecificRuntimeEnv(env, options);
+}
+
+function getWindowsEssentialEnv(): Record<string, string> {
+  const home = os.homedir();
+  return {
+    PATH: process.env.PATH || process.env.Path || '',
+    PATHEXT: process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC',
+    SystemRoot: process.env.SystemRoot || 'C:\\Windows',
+    ComSpec: process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe',
+    TEMP: process.env.TEMP || process.env.TMP || '',
+    TMP: process.env.TMP || process.env.TEMP || '',
+    USERPROFILE: process.env.USERPROFILE || home,
+    APPDATA: process.env.APPDATA || '',
+    LOCALAPPDATA: process.env.LOCALAPPDATA || '',
+    HOMEDRIVE: process.env.HOMEDRIVE || '',
+    HOMEPATH: process.env.HOMEPATH || '',
+    USERNAME: process.env.USERNAME || os.userInfo().username,
+    // Program file paths needed by .NET, NuGet, MSBuild, and other tools
+    ProgramFiles: process.env.ProgramFiles || 'C:\\Program Files',
+    'ProgramFiles(x86)': process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)',
+    ProgramData: process.env.ProgramData || 'C:\\ProgramData',
+    CommonProgramFiles: process.env.CommonProgramFiles || 'C:\\Program Files\\Common Files',
+    'CommonProgramFiles(x86)':
+      process.env['CommonProgramFiles(x86)'] || 'C:\\Program Files (x86)\\Common Files',
+    ProgramW6432: process.env.ProgramW6432 || 'C:\\Program Files',
+    CommonProgramW6432: process.env.CommonProgramW6432 || 'C:\\Program Files\\Common Files',
+  };
+}
+
+// Display/desktop env vars needed for GUI operations from within PTY sessions.
+const DISPLAY_ENV_VARS = [
+  'DISPLAY', // X11 display server
+  'XAUTHORITY', // X11 auth cookie (often at non-standard path on Wayland+GNOME)
+  'WAYLAND_DISPLAY', // Wayland compositor socket
+  'XDG_RUNTIME_DIR', // Contains Wayland/D-Bus sockets (e.g. /run/user/1000)
+  'XDG_CURRENT_DESKTOP', // Used by xdg-open for DE detection (e.g. "GNOME")
+  'XDG_SESSION_TYPE', // Used by browsers/toolkits to select X11 vs Wayland
+  'XDG_DATA_DIRS', // .desktop file search paths; includes snap/flatpak dirs set by session
+  'DBUS_SESSION_BUS_ADDRESS', // Needed by gio open and desktop portals
+] as const;
+
+function getDisplayEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of DISPLAY_ENV_VARS) {
+    if (process.env[key]) {
+      env[key] = process.env[key] as string;
+    }
+  }
+  return env;
+}
+
+// --- Tmux session helpers ---
+
+/**
+ * Derive a deterministic tmux session name from a PTY ID.
+ * Sanitizes to characters allowed by tmux (alphanumeric, `-`, `_`, `.`).
+ */
+export function getTmuxSessionName(ptyId: string): string {
+  // PTY ID format: {providerId}-main-{taskId} or {providerId}-chat-{conversationId}
+  // Prefix with "emdash-" and sanitize
+  const sanitized = ptyId.replace(/[^a-zA-Z0-9._-]/g, '-');
+  return `emdash-${sanitized}`;
+}
+
+/**
+ * Kill a tmux session by PTY ID. Fire-and-forget — ignores errors
+ * for non-existent sessions (e.g., tmux not installed or session already dead).
+ */
+export function killTmuxSession(ptyId: string): void {
+  const sessionName = getTmuxSessionName(ptyId);
+  try {
+    const { execFile } = require('child_process');
+    execFile('tmux', ['kill-session', '-t', sessionName], { timeout: 5000 }, (err: any) => {
+      if (!err) {
+        log.info('ptyManager:tmux - killed session', { sessionName });
+      }
+      // Ignore errors — session may not exist or tmux not installed
+    });
+  } catch {
+    // Ignore
+  }
+}
+
+// TODO: Remote tmux cleanup will be handled by the workspace provider teardown script.
+// The PTY record doesn't currently store SSH target/args, so we can't shell out
+// `ssh <target> tmux kill-session` from here. When workspace providers land, the
+// teardown script is the right place for this.
+
+function resolveWindowsPtySpawn(
+  command: string,
+  args: string[]
+): { command: string; args: string[] } {
+  if (process.platform !== 'win32') return { command, args };
+
+  const quoteForCmdExe = (input: string): string => {
+    if (input.length === 0) return '""';
+    if (!/[\s"^&|<>()%!]/.test(input)) return input;
+    return `"${input
+      .replace(/%/g, '%%')
+      .replace(/!/g, '^!')
+      .replace(/(["^&|<>()])/g, '^$1')}"`;
+  };
+
+  const ext = path.extname(command).toLowerCase();
+  if (ext === '.cmd' || ext === '.bat') {
+    const comspec = process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe';
+    const fullCommandString = [command, ...args].map(quoteForCmdExe).join(' ');
+    return { command: comspec, args: ['/d', '/s', '/c', fullCommandString] };
+  }
+  if (ext === '.ps1') {
+    return {
+      command: 'powershell.exe',
+      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', command, ...args],
+    };
+  }
+
+  return { command, args };
+}
 
 /**
  * Generate a deterministic UUID from an arbitrary string.
@@ -78,19 +239,39 @@ function deterministicUuid(input: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
+type SessionStrategy = 'claude-session-id' | 'codex-thread-id';
+
 // ---------------------------------------------------------------------------
-// Persistent session-ID map
+// Persistent session map
 //
-// Tracks which PTY IDs have already been started with --session-id so we
-// know whether to create a new session or resume an existing one.
+// Tracks the exact resume target for PTYs that support strong session restore.
 //
-//   First start  → no entry  → --session-id <uuid>  (create)
-//   Restart      → entry     → --resume <uuid>      (resume)
+// Claude stores proactively assigned session IDs.
+// Codex stores discovered thread IDs after first launch.
 // ---------------------------------------------------------------------------
-type SessionEntry = { uuid: string; cwd: string };
+type SessionEntry = {
+  cwd: string;
+  providerId?: string;
+  uuid?: string;
+  resumeTarget?: string;
+  strategy?: SessionStrategy;
+};
+
+type NormalizedSessionEntry = {
+  cwd: string;
+  providerId: string;
+  target: string;
+  strategy: SessionStrategy;
+};
 
 let _sessionMapPath: string | null = null;
 let _sessionMap: Record<string, SessionEntry> | null = null;
+
+/** @internal Exported for testing. Sets session map path and clears the cache. */
+export function _resetSessionMapForTest(mapPath: string): void {
+  _sessionMapPath = mapPath;
+  _sessionMap = null;
+}
 
 function sessionMapPath(): string {
   if (!_sessionMapPath) {
@@ -111,26 +292,114 @@ function loadSessionMap(): Record<string, SessionEntry> {
   return _sessionMap!;
 }
 
-function getKnownSessionId(ptyId: string): string | undefined {
-  return loadSessionMap()[ptyId]?.uuid;
+function getNormalizedSessionEntry(
+  ptyId: string,
+  entry: SessionEntry | undefined
+): NormalizedSessionEntry | null {
+  if (!entry || typeof entry !== 'object' || typeof entry.cwd !== 'string' || !entry.cwd) {
+    return null;
+  }
+
+  const parsed = parsePtyId(ptyId);
+  const providerId = entry.providerId || parsed?.providerId;
+  if (!providerId) return null;
+
+  if (typeof entry.resumeTarget === 'string' && entry.resumeTarget.trim()) {
+    return {
+      cwd: entry.cwd,
+      providerId,
+      target: entry.resumeTarget,
+      strategy:
+        entry.strategy === 'claude-session-id' || entry.strategy === 'codex-thread-id'
+          ? entry.strategy
+          : providerId === 'codex'
+            ? 'codex-thread-id'
+            : 'claude-session-id',
+    };
+  }
+
+  if (typeof entry.uuid === 'string' && entry.uuid.trim()) {
+    return {
+      cwd: entry.cwd,
+      providerId,
+      target: entry.uuid,
+      strategy: 'claude-session-id',
+    };
+  }
+
+  return null;
 }
 
 /** Check if the session map has entries for other chats of the same provider in the same cwd. */
 function hasOtherSameProviderSessions(ptyId: string, providerId: string, cwd: string): boolean {
   const map = loadSessionMap();
-  const prefix = `${providerId}-`;
-  return Object.entries(map).some(
-    ([key, entry]) => key.startsWith(prefix) && key !== ptyId && entry.cwd === cwd
-  );
+  return Object.entries(map).some(([key, entry]) => {
+    if (key === ptyId) return false;
+    const normalized = getNormalizedSessionEntry(key, entry);
+    return normalized?.providerId === providerId && normalized.cwd === cwd;
+  });
 }
 
-function markSessionCreated(ptyId: string, uuid: string, cwd: string): void {
+function persistSessionMap(): void {
+  try {
+    fs.writeFileSync(sessionMapPath(), JSON.stringify(loadSessionMap()));
+  } catch (e) {
+    log.warn('ptyManager: failed to persist session map', e);
+  }
+}
+
+function setSessionEntry(ptyId: string, entry: SessionEntry): void {
   const map = loadSessionMap();
-  map[ptyId] = { uuid, cwd };
+  map[ptyId] = entry;
+  persistSessionMap();
+}
+
+function markClaudeSessionCreated(ptyId: string, uuid: string, cwd: string): void {
+  setSessionEntry(ptyId, {
+    cwd,
+    providerId: 'claude',
+    uuid,
+    strategy: 'claude-session-id',
+  });
+}
+
+export function markCodexSessionBound(ptyId: string, threadId: string, cwd: string): void {
+  setSessionEntry(ptyId, {
+    cwd,
+    providerId: 'codex',
+    resumeTarget: threadId,
+    strategy: 'codex-thread-id',
+  });
+}
+
+export function clearStoredSession(ptyId: string): void {
+  const map = loadSessionMap();
+  delete map[ptyId];
   try {
     fs.writeFileSync(sessionMapPath(), JSON.stringify(map));
   } catch (e) {
-    log.warn('ptyManager: failed to persist session map', e);
+    log.warn('ptyManager: failed to persist session map after removal', e);
+  }
+}
+
+export function getStoredResumeTarget(
+  ptyId: string,
+  providerId: string,
+  cwd?: string
+): string | null {
+  const normalized = getNormalizedSessionEntry(ptyId, loadSessionMap()[ptyId]);
+  if (!normalized || normalized.providerId !== providerId) return null;
+  if (cwd && normalized.cwd !== cwd) return null;
+  return normalized.target;
+}
+
+function claudeSessionFileExists(uuid: string, cwd: string): boolean {
+  try {
+    const encoded = cwd.replace(/[:\\/]/g, '-');
+    const sessionFile = path.join(os.homedir(), '.claude', 'projects', encoded, `${uuid}.jsonl`);
+    return fs.existsSync(sessionFile);
+  } catch {
+    return false;
   }
 }
 
@@ -146,8 +415,8 @@ function markSessionCreated(ptyId: string, uuid: string, cwd: string): void {
  */
 function discoverExistingClaudeSession(cwd: string, excludeUuids: Set<string>): string | null {
   try {
-    // Claude encodes project paths by replacing '/' with '-'
-    const encoded = cwd.replace(/\//g, '-');
+    // Claude encodes project paths by replacing path separators; on Windows also strip ':'.
+    const encoded = cwd.replace(/[:\\/]/g, '-');
     const projectDir = path.join(os.homedir(), '.claude', 'projects', encoded);
 
     if (!fs.existsSync(projectDir)) return null;
@@ -179,11 +448,16 @@ function discoverExistingClaudeSession(cwd: string, excludeUuids: Set<string>): 
 /** Collect all session UUIDs from the map that belong to a given provider in the same cwd, excluding one PTY. */
 function getOtherSessionUuids(ptyId: string, providerId: string, cwd: string): Set<string> {
   const map = loadSessionMap();
-  const prefix = `${providerId}-`;
   const uuids = new Set<string>();
   for (const [key, entry] of Object.entries(map)) {
-    if (key.startsWith(prefix) && key !== ptyId && entry.cwd === cwd) {
-      uuids.add(entry.uuid);
+    if (key === ptyId) continue;
+    const normalized = getNormalizedSessionEntry(key, entry);
+    if (
+      normalized?.providerId === providerId &&
+      normalized.cwd === cwd &&
+      normalized.strategy === 'claude-session-id'
+    ) {
+      uuids.add(normalized.target);
     }
   }
   return uuids;
@@ -201,7 +475,7 @@ function getOtherSessionUuids(ptyId: string, providerId: string, cwd: string): S
  *
  * Returns true if session isolation args were added.
  */
-function applySessionIsolation(
+export function applySessionIsolation(
   cliArgs: string[],
   provider: ProviderDefinition,
   id: string,
@@ -216,15 +490,38 @@ function applySessionIsolation(
   const sessionUuid = deterministicUuid(parsed.suffix);
   const isAdditionalChat = parsed.kind === 'chat';
 
-  const knownSession = getKnownSessionId(id);
+  const knownEntry = getNormalizedSessionEntry(id, loadSessionMap()[id]);
+  const knownSession =
+    knownEntry?.providerId === provider.id && knownEntry.strategy === 'claude-session-id'
+      ? knownEntry.target
+      : null;
   if (knownSession) {
-    cliArgs.push('--resume', knownSession);
-    return true;
+    // For Claude, validate the session still exists on disk before resuming.
+    // Also treat cwd mismatch as stale — the session belongs to a different
+    // project context and Claude would look in the wrong directory.
+    if (provider.id === 'claude') {
+      const isStale = knownEntry!.cwd !== cwd || !claudeSessionFileExists(knownSession, cwd);
+      if (isStale) {
+        log.warn('ptyManager: stale session detected, creating new session', {
+          ptyId: id,
+          staleUuid: knownSession,
+        });
+        clearStoredSession(id);
+        // Fall through — the decision tree below will create a new session
+        // or the caller will use generic resume flags
+      } else {
+        cliArgs.push('--resume', knownSession);
+        return true;
+      }
+    } else {
+      cliArgs.push('--resume', knownSession);
+      return true;
+    }
   }
 
   if (isAdditionalChat) {
     cliArgs.push(provider.sessionIdFlag, sessionUuid);
-    markSessionCreated(id, sessionUuid, cwd);
+    markClaudeSessionCreated(id, sessionUuid, cwd);
     return true;
   }
 
@@ -235,10 +532,10 @@ function applySessionIsolation(
     const existingSession = discoverExistingClaudeSession(cwd, otherUuids);
     if (existingSession) {
       cliArgs.push(provider.sessionIdFlag, existingSession);
-      markSessionCreated(id, existingSession, cwd);
+      markClaudeSessionCreated(id, existingSession, cwd);
     } else {
       cliArgs.push(provider.sessionIdFlag, sessionUuid);
-      markSessionCreated(id, sessionUuid, cwd);
+      markClaudeSessionCreated(id, sessionUuid, cwd);
     }
     return true;
   }
@@ -247,11 +544,27 @@ function applySessionIsolation(
     // First-time creation — proactively assign a session ID so we can
     // reliably resume later if more chats of this provider are added.
     cliArgs.push(provider.sessionIdFlag, sessionUuid);
-    markSessionCreated(id, sessionUuid, cwd);
+    markClaudeSessionCreated(id, sessionUuid, cwd);
     return true;
   }
 
   return false;
+}
+
+export function getStoredExactResumeArgs(providerId: string, ptyId: string, cwd: string): string[] {
+  const provider = PROVIDERS.find((item) => item.id === providerId);
+  if (!provider) return [];
+
+  const entry = getNormalizedSessionEntry(ptyId, loadSessionMap()[ptyId]);
+  if (!entry || entry.cwd !== cwd || entry.providerId !== provider.id) {
+    return [];
+  }
+
+  if (provider.id === 'codex' && entry.strategy === 'codex-thread-id') {
+    return ['resume', entry.target];
+  }
+
+  return [];
 }
 
 /**
@@ -281,10 +594,19 @@ export function parseShellArgs(input: string): string[] {
       continue;
     }
 
-    if (char === '\\' && !inSingleQuote) {
-      // Backslash escapes next character (except inside single quotes)
-      escape = true;
-      continue;
+    if (char === '\\') {
+      if (process.platform === 'win32') {
+        // Preserve backslashes for Windows paths. Only treat \" inside double-quotes as an escape.
+        const next = input[i + 1];
+        if (inDoubleQuote && next === '"') {
+          escape = true;
+          continue;
+        }
+      } else if (!inSingleQuote) {
+        // POSIX-style backslash escapes next character (except inside single quotes)
+        escape = true;
+        continue;
+      }
     }
 
     if (char === "'" && !inDoubleQuote) {
@@ -336,17 +658,26 @@ export type ResolvedProviderCommandConfig = {
   defaultArgs?: string[];
   autoApproveFlag?: string;
   initialPromptFlag?: string;
+  extraArgs?: string[];
+  env?: Record<string, string>;
 };
 
 type ProviderCliArgsOptions = {
   resume?: boolean;
   resumeFlag?: string;
   defaultArgs?: string[];
+  extraArgs?: string[];
   autoApprove?: boolean;
   autoApproveFlag?: string;
   initialPrompt?: string;
   initialPromptFlag?: string;
   useKeystrokeInjection?: boolean;
+};
+
+type ProviderRuntimeCliArgsOptions = {
+  providerId: string;
+  target?: 'local' | 'remote';
+  platform?: NodeJS.Platform;
 };
 
 export function resolveProviderCommandConfig(
@@ -356,6 +687,22 @@ export function resolveProviderCommandConfig(
   if (!provider) return null;
 
   const customConfig = getProviderCustomConfig(provider.id);
+
+  const extraArgs =
+    customConfig?.extraArgs !== undefined && customConfig.extraArgs.trim() !== ''
+      ? parseShellArgs(customConfig.extraArgs.trim())
+      : undefined;
+
+  let env: Record<string, string> | undefined;
+  if (customConfig?.env && typeof customConfig.env === 'object') {
+    env = {};
+    for (const [k, v] of Object.entries(customConfig.env)) {
+      if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
+        env[k] = v;
+      }
+    }
+    if (Object.keys(env).length === 0) env = undefined;
+  }
 
   return {
     provider,
@@ -377,6 +724,8 @@ export function resolveProviderCommandConfig(
       customConfig?.initialPromptFlag !== undefined
         ? customConfig.initialPromptFlag
         : provider.initialPromptFlag,
+    extraArgs,
+    env,
   };
 }
 
@@ -406,7 +755,85 @@ export function buildProviderCliArgs(options: ProviderCliArgsOptions): string[] 
     args.push(options.initialPrompt.trim());
   }
 
+  if (options.extraArgs?.length) {
+    args.push(...options.extraArgs);
+  }
+
   return args;
+}
+
+function makePosixCodexNotifyCommand(): string[] {
+  const script =
+    `printf '%s' "$1" | ` +
+    `curl -sf -X POST ` +
+    `-H 'Content-Type: application/json' ` +
+    `-H "X-Emdash-Token: $EMDASH_HOOK_TOKEN" ` +
+    `-H "X-Emdash-Pty-Id: $EMDASH_PTY_ID" ` +
+    `-H 'X-Emdash-Event-Type: notification' ` +
+    `-d @- ` +
+    `"http://127.0.0.1:$EMDASH_HOOK_PORT/hook" || true`;
+
+  return ['sh', '-lc', script, 'sh'];
+}
+
+function ensureWindowsCodexNotifyScript(): string {
+  const scriptPath = path.join(os.tmpdir(), 'emdash-codex-notify.ps1');
+  const script = [
+    'param([string]$payload)',
+    'try {',
+    '  Invoke-WebRequest -UseBasicParsing -Method POST ' +
+      "-Uri ('http://127.0.0.1:' + $env:EMDASH_HOOK_PORT + '/hook') " +
+      '-Headers @{ ' +
+      "'Content-Type' = 'application/json'; " +
+      "'X-Emdash-Token' = $env:EMDASH_HOOK_TOKEN; " +
+      "'X-Emdash-Pty-Id' = $env:EMDASH_PTY_ID; " +
+      "'X-Emdash-Event-Type' = 'notification' " +
+      '} -Body $payload | Out-Null',
+    '} catch {',
+    '  exit 0',
+    '}',
+    '',
+  ].join('\n');
+
+  try {
+    fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+    fs.writeFileSync(scriptPath, script);
+  } catch (err) {
+    log.warn('ptyManager: failed to write Codex Windows notify script', {
+      path: scriptPath,
+      error: String(err),
+    });
+  }
+
+  return scriptPath;
+}
+
+function makeWindowsCodexNotifyCommand(): string[] {
+  // Use -File so Codex's appended payload argument binds reliably as a script parameter.
+  return ['powershell.exe', '-NoProfile', '-File', ensureWindowsCodexNotifyScript()];
+}
+
+function makeCodexNotifyConfigValue(target: 'local' | 'remote', platform: NodeJS.Platform): string {
+  const notifyCommand =
+    target === 'remote' || platform !== 'win32'
+      ? makePosixCodexNotifyCommand()
+      : makeWindowsCodexNotifyCommand();
+
+  return `notify=${JSON.stringify(notifyCommand)}`;
+}
+
+export function getProviderRuntimeCliArgs(options: ProviderRuntimeCliArgsOptions): string[] {
+  const { providerId, target = 'local', platform = process.platform } = options;
+
+  if (providerId !== 'codex') {
+    return [];
+  }
+
+  if (agentEventService.getPort() <= 0) {
+    return [];
+  }
+
+  return ['-c', makeCodexNotifyConfigValue(target, platform)];
 }
 
 const resolvedCommandPathCache = new Map<string, string | null>();
@@ -558,9 +985,12 @@ export function startSshPty(options: {
     TERM_PROGRAM: 'emdash',
     HOME: process.env.HOME || os.homedir(),
     USER: process.env.USER || os.userInfo().username,
-    PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+    PATH: process.env.PATH || process.env.Path || '',
     ...(process.env.LANG && { LANG: process.env.LANG }),
+    ...(process.env.TMPDIR && { TMPDIR: process.env.TMPDIR }),
+    ...getDisplayEnv(),
     ...(process.env.SSH_AUTH_SOCK && { SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK }),
+    ...(process.platform === 'win32' ? getWindowsEssentialEnv() : {}),
   };
 
   // Pass through agent authentication env vars (same allowlist as direct spawn)
@@ -614,9 +1044,18 @@ export function startDirectPty(options: {
   initialPrompt?: string;
   env?: Record<string, string>;
   resume?: boolean;
+  tmux?: boolean;
 }): IPty | null {
   if (process.env.EMDASH_DISABLE_PTY === '1') {
     throw new Error('PTY disabled via EMDASH_DISABLE_PTY=1');
+  }
+
+  // Tmux wrapping requires a shell — fall back to startPty() which handles tmux.
+  if (options.tmux) {
+    log.info('ptyManager:directSpawn - tmux enabled, falling back to shell spawn', {
+      id: options.id,
+    });
+    return null;
   }
 
   const {
@@ -680,15 +1119,18 @@ export function startDirectPty(options: {
   const cliArgs: string[] = [];
 
   if (provider && resolvedConfig) {
+    const exactResumeArgs = getStoredExactResumeArgs(provider.id, id, cwd);
     // Session isolation for multi-chat scenarios.
     // See applySessionIsolation() for the full decision tree.
     const usedSessionIsolation = applySessionIsolation(cliArgs, provider, id, cwd, !!resume);
 
+    cliArgs.push(...exactResumeArgs);
     cliArgs.push(
       ...buildProviderCliArgs({
-        resume: !usedSessionIsolation && !!resume,
+        resume: exactResumeArgs.length === 0 && !usedSessionIsolation && !!resume,
         resumeFlag: resolvedConfig.resumeFlag,
         defaultArgs: resolvedConfig.defaultArgs,
+        extraArgs: resolvedConfig.extraArgs,
         autoApprove,
         autoApproveFlag: resolvedConfig.autoApproveFlag,
         initialPrompt,
@@ -696,6 +1138,7 @@ export function startDirectPty(options: {
         useKeystrokeInjection: provider.useKeystrokeInjection,
       })
     );
+    cliArgs.push(...getProviderRuntimeCliArgs({ providerId }));
   }
 
   // Build minimal environment - just what the CLI needs
@@ -706,15 +1149,26 @@ export function startDirectPty(options: {
     HOME: process.env.HOME || os.homedir(),
     USER: process.env.USER || os.userInfo().username,
     // Include PATH so CLI can find its dependencies
-    PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+    PATH: process.env.PATH || process.env.Path || '',
     ...(process.env.LANG && { LANG: process.env.LANG }),
+    ...(process.env.TMPDIR && { TMPDIR: process.env.TMPDIR }),
+    ...getDisplayEnv(),
     ...(process.env.SSH_AUTH_SOCK && { SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK }),
+    ...(process.platform === 'win32' ? getWindowsEssentialEnv() : {}),
   };
 
   // Pass through agent authentication env vars
   for (const key of AGENT_ENV_VARS) {
     if (process.env[key]) {
       useEnv[key] = process.env[key];
+    }
+  }
+
+  if (resolvedConfig?.env) {
+    for (const [key, value] of Object.entries(resolvedConfig.env)) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string') {
+        useEnv[key] = value;
+      }
     }
   }
 
@@ -727,6 +1181,8 @@ export function startDirectPty(options: {
     }
   }
 
+  applyProviderRuntimeEnv(useEnv, { ptyId: id, providerId });
+
   // Lazy load native module
   let pty: typeof import('node-pty');
   try {
@@ -735,7 +1191,8 @@ export function startDirectPty(options: {
     throw new Error(`PTY unavailable: ${e?.message || String(e)}`);
   }
 
-  const proc = pty.spawn(cliPath, cliArgs, {
+  const spawnSpec = resolveWindowsPtySpawn(cliPath, cliArgs);
+  const proc = pty.spawn(spawnSpec.command, spawnSpec.args, {
     name: 'xterm-256color',
     cols,
     rows,
@@ -776,6 +1233,8 @@ export async function startPty(options: {
   autoApprove?: boolean;
   initialPrompt?: string;
   skipResume?: boolean;
+  shellSetup?: string;
+  tmux?: boolean;
 }): Promise<IPty> {
   if (process.env.EMDASH_DISABLE_PTY === '1') {
     throw new Error('PTY disabled via EMDASH_DISABLE_PTY=1');
@@ -790,11 +1249,13 @@ export async function startPty(options: {
     autoApprove,
     initialPrompt,
     skipResume,
+    shellSetup,
+    tmux,
   } = options;
 
   const defaultShell = getDefaultShell();
   let useShell = shell || defaultShell;
-  const useCwd = cwd || process.cwd() || os.homedir();
+  const useCwd = cwd || os.homedir();
 
   // Build a clean environment instead of inheriting process.env wholesale.
   //
@@ -817,11 +1278,17 @@ export async function startPty(options: {
     HOME: process.env.HOME || os.homedir(),
     USER: process.env.USER || os.userInfo().username,
     SHELL: process.env.SHELL || defaultShell,
+    ...(process.platform === 'win32' ? getWindowsEssentialEnv() : {}),
     ...(process.env.LANG && { LANG: process.env.LANG }),
+    ...(process.env.TMPDIR && { TMPDIR: process.env.TMPDIR }),
     ...(process.env.DISPLAY && { DISPLAY: process.env.DISPLAY }),
+    ...getDisplayEnv(),
     ...(process.env.SSH_AUTH_SOCK && { SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK }),
     ...(env || {}),
   };
+
+  applyAgentEventHookEnv(useEnv, id);
+
   // On Windows, resolve shell command to full path for node-pty
   if (process.platform === 'win32' && shell && !shell.includes('\\') && !shell.includes('/')) {
     try {
@@ -890,9 +1357,11 @@ export async function startPty(options: {
       if (provider) {
         const resolvedConfig = resolveProviderCommandConfig(provider.id);
         const resolvedCli = resolvedConfig?.cli || provider.cli || baseLower;
+        applyProviderSpecificRuntimeEnv(useEnv, { ptyId: id, providerId: provider.id });
 
         // Build the provider command with flags
         const cliArgs: string[] = [];
+        const exactResumeArgs = getStoredExactResumeArgs(provider.id, id, useCwd);
 
         // Session isolation — see applySessionIsolation() for the full decision tree.
         const usedSessionIsolation = applySessionIsolation(
@@ -903,11 +1372,13 @@ export async function startPty(options: {
           !skipResume
         );
 
+        cliArgs.push(...exactResumeArgs);
         cliArgs.push(
           ...buildProviderCliArgs({
-            resume: !usedSessionIsolation && !skipResume,
+            resume: exactResumeArgs.length === 0 && !usedSessionIsolation && !skipResume,
             resumeFlag: resolvedConfig?.resumeFlag,
             defaultArgs: resolvedConfig?.defaultArgs,
+            extraArgs: resolvedConfig?.extraArgs,
             autoApprove,
             autoApproveFlag: resolvedConfig?.autoApproveFlag,
             initialPrompt,
@@ -915,6 +1386,15 @@ export async function startPty(options: {
             useKeystrokeInjection: provider.useKeystrokeInjection,
           })
         );
+        cliArgs.push(...getProviderRuntimeCliArgs({ providerId: provider.id }));
+
+        if (resolvedConfig?.env) {
+          for (const [k, v] of Object.entries(resolvedConfig.env)) {
+            if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) && typeof v === 'string') {
+              useEnv[k] = v;
+            }
+          }
+        }
 
         const cliCommand = resolvedCli;
         const commandString =
@@ -926,32 +1406,80 @@ export async function startPty(options: {
                 .join(' ')}`
             : cliCommand;
 
+        const shellBase = (defaultShell.split('/').pop() || '').toLowerCase();
+
         // After the provider exits, exec back into the user's shell (login+interactive)
-        const resumeShell = `'${defaultShell.replace(/'/g, "'\\''")}' -il`;
-        const chainCommand = `${commandString}; exec ${resumeShell}`;
+        const resumeShell =
+          shellBase === 'fish'
+            ? `'${defaultShell.replace(/'/g, "'\\''")}' -i -l`
+            : `'${defaultShell.replace(/'/g, "'\\''")}' -il`;
+        const chainCommand = shellSetup
+          ? `${shellSetup} && ${commandString}; exec ${resumeShell}`
+          : `${commandString}; exec ${resumeShell}`;
 
         // Always use the default shell for the -c command to avoid re-detecting provider CLI
         useShell = defaultShell;
-        const shellBase = defaultShell.split('/').pop() || '';
         if (shellBase === 'zsh') args.push('-lic', chainCommand);
         else if (shellBase === 'bash') args.push('-lic', chainCommand);
-        else if (shellBase === 'fish') args.push('-ic', chainCommand);
+        else if (shellBase === 'fish') args.push('-l', '-i', '-c', chainCommand);
         else if (shellBase === 'sh') args.push('-lc', chainCommand);
         else args.push('-c', chainCommand); // Fallback for other shells
       } else {
         // For normal shells, use login + interactive to load user configs
-        if (base === 'zsh') args.push('-il');
-        else if (base === 'bash') args.push('-il');
-        else if (base === 'fish') args.push('-il');
-        else if (base === 'sh') args.push('-il');
-        else args.push('-i'); // Fallback for other shells
+        if (shellSetup) {
+          const resumeShell =
+            baseLower === 'fish'
+              ? `'${useShell.replace(/'/g, "'\\''")}' -i -l`
+              : `'${useShell.replace(/'/g, "'\\''")}' -il`;
+          if (baseLower === 'fish') {
+            args.push('-l', '-i', '-c', `${shellSetup}; exec ${resumeShell}`);
+          } else {
+            const cFlag = baseLower === 'sh' ? '-lc' : '-lic';
+            args.push(cFlag, `${shellSetup}; exec ${resumeShell}`);
+          }
+        } else {
+          if (baseLower === 'fish') {
+            args.push('-i', '-l');
+          } else {
+            args.push(
+              baseLower === 'zsh' || baseLower === 'bash' || baseLower === 'sh' ? '-il' : '-i'
+            );
+          }
+        }
       }
     } catch {}
   }
 
+  // When tmux is enabled, wrap the spawn in a tmux session.
+  // tmux new-session -As <name> creates or attaches to a named session.
+  // The inner shell command (with the agent CLI) runs inside tmux.
+  let tmuxSessionName: string | undefined;
+  let spawnCommand = useShell;
+  let spawnArgs = args;
+
+  if (tmux && process.platform !== 'win32') {
+    let tmuxAvailable = false;
+    try {
+      const { execFileSync } = require('child_process');
+      execFileSync('tmux', ['-V'], { timeout: 3000, stdio: 'ignore' });
+      tmuxAvailable = true;
+    } catch {
+      log.warn('ptyManager:tmux - tmux not found, falling back to unwrapped spawn', { id });
+    }
+
+    if (tmuxAvailable) {
+      tmuxSessionName = getTmuxSessionName(id);
+      // Build: tmux new-session -As <name> -- <shell> <args...>
+      spawnCommand = 'tmux';
+      spawnArgs = ['new-session', '-As', tmuxSessionName, '--', useShell, ...args];
+      log.info('ptyManager:tmux - wrapping in tmux session', { id, tmuxSessionName });
+    }
+  }
+
   let proc: IPty;
   try {
-    proc = pty.spawn(useShell, args, {
+    const spawnSpec = resolveWindowsPtySpawn(spawnCommand, spawnArgs);
+    proc = pty.spawn(spawnSpec.command, spawnSpec.args, {
       name: 'xterm-256color',
       cols,
       rows,
@@ -989,7 +1517,7 @@ export async function startPty(options: {
     }
   }
 
-  ptys.set(id, { id, proc, kind: 'local', cols, rows });
+  ptys.set(id, { id, proc, kind: 'local', cols, rows, tmuxSessionName });
   return proc;
 }
 
@@ -1062,4 +1590,8 @@ export function getPty(id: string): IPty | undefined {
 
 export function getPtyKind(id: string): 'local' | 'ssh' | undefined {
   return ptys.get(id)?.kind;
+}
+
+export function getPtyTmuxSessionName(id: string): string | undefined {
+  return ptys.get(id)?.tmuxSessionName;
 }

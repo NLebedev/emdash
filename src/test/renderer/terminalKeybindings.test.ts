@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   CTRL_J_ASCII,
+  CTRL_U_ASCII,
   shouldCopySelectionFromTerminal,
+  shouldKillLineFromTerminal,
   shouldMapShiftEnterToCtrlJ,
+  shouldPasteToTerminal,
   type KeyEventLike,
 } from '../../renderer/terminal/terminalKeybindings';
 
@@ -90,6 +93,105 @@ describe('TerminalSessionManager - Shift+Enter to Ctrl+J mapping', () => {
         makeEvent({ key: 'c', altKey: true, ctrlKey: true }),
         false,
         withSelection
+      )
+    ).toBe(false);
+  });
+
+  it('detects Ctrl+Shift+V paste on Linux only', () => {
+    const isMac = true;
+    const isNotMac = false;
+
+    // Ctrl+Shift+V on Linux should trigger paste
+    expect(
+      shouldPasteToTerminal(makeEvent({ key: 'v', ctrlKey: true, shiftKey: true }), isNotMac)
+    ).toBe(true);
+
+    // Ctrl+Shift+V on macOS should NOT trigger paste (macOS uses Cmd+V)
+    expect(
+      shouldPasteToTerminal(makeEvent({ key: 'v', ctrlKey: true, shiftKey: true }), isMac)
+    ).toBe(false);
+
+    // Ctrl+V alone should NOT trigger (that's SIGINT in terminals)
+    expect(shouldPasteToTerminal(makeEvent({ key: 'v', ctrlKey: true }), isNotMac)).toBe(false);
+
+    // Additional modifiers should NOT trigger
+    expect(
+      shouldPasteToTerminal(
+        makeEvent({ key: 'v', ctrlKey: true, shiftKey: true, altKey: true }),
+        isNotMac
+      )
+    ).toBe(false);
+    expect(
+      shouldPasteToTerminal(
+        makeEvent({ key: 'v', ctrlKey: true, shiftKey: true, metaKey: true }),
+        isNotMac
+      )
+    ).toBe(false);
+
+    // Wrong key should NOT trigger
+    expect(
+      shouldPasteToTerminal(makeEvent({ key: 'c', ctrlKey: true, shiftKey: true }), isNotMac)
+    ).toBe(false);
+
+    // keyup should NOT trigger
+    expect(
+      shouldPasteToTerminal(
+        makeEvent({ type: 'keyup', key: 'v', ctrlKey: true, shiftKey: true }),
+        isNotMac
+      )
+    ).toBe(false);
+  });
+
+  it('uses Ctrl+U for kill-line', () => {
+    expect(CTRL_U_ASCII).toBe('\x15');
+  });
+
+  it('detects Cmd+Backspace on macOS only', () => {
+    const isMac = true;
+    const isNotMac = false;
+
+    // Cmd+Backspace on macOS should trigger
+    expect(shouldKillLineFromTerminal(makeEvent({ key: 'Backspace', metaKey: true }), isMac)).toBe(
+      true
+    );
+
+    // Cmd+Backspace on Linux/Windows should NOT trigger
+    expect(
+      shouldKillLineFromTerminal(makeEvent({ key: 'Backspace', metaKey: true }), isNotMac)
+    ).toBe(false);
+
+    // Ctrl+Backspace should NOT trigger on any platform
+    expect(shouldKillLineFromTerminal(makeEvent({ key: 'Backspace', ctrlKey: true }), isMac)).toBe(
+      false
+    );
+    expect(
+      shouldKillLineFromTerminal(makeEvent({ key: 'Backspace', ctrlKey: true }), isNotMac)
+    ).toBe(false);
+
+    // Additional modifiers should NOT trigger
+    expect(
+      shouldKillLineFromTerminal(
+        makeEvent({ key: 'Backspace', metaKey: true, shiftKey: true }),
+        isMac
+      )
+    ).toBe(false);
+    expect(
+      shouldKillLineFromTerminal(
+        makeEvent({ key: 'Backspace', metaKey: true, altKey: true }),
+        isMac
+      )
+    ).toBe(false);
+
+    // Wrong key should NOT trigger
+    expect(shouldKillLineFromTerminal(makeEvent({ key: 'Delete', metaKey: true }), isMac)).toBe(
+      false
+    );
+
+    // keyup should NOT trigger
+    expect(
+      shouldKillLineFromTerminal(
+        makeEvent({ type: 'keyup', key: 'Backspace', metaKey: true }),
+        isMac
       )
     ).toBe(false);
   });

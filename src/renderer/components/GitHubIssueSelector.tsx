@@ -196,7 +196,7 @@ export const GitHubIssueSelector: React.FC<GitHubIssueSelectorProps> = ({
 
   const selectBody = (
     <Select
-      value={selectedIssue ? `#${selectedIssue.number}` : undefined}
+      value={selectedIssue ? `#${selectedIssue.number}` : '__clear__'}
       onValueChange={handleIssueSelect}
       disabled={disabled || isLoadingIssues || !!issueListError || !issuesLoaded}
     >
@@ -228,7 +228,14 @@ export const GitHubIssueSelector: React.FC<GitHubIssueSelectorProps> = ({
           ) : (
             <>
               <img src={githubLogo} alt="GitHub" className="h-3.5 w-3.5" />
-              <span className="truncate text-muted-foreground">{issuePlaceholder}</span>
+              {isLoadingIssues ? (
+                <>
+                  <span className="truncate text-muted-foreground">Loading GitHub issues</span>
+                  <Spinner size="sm" />
+                </>
+              ) : (
+                <span className="truncate text-muted-foreground">{issuePlaceholder}</span>
+              )}
             </>
           )}
         </div>
